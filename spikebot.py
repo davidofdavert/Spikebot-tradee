@@ -1,104 +1,147 @@
 import websocket
 import json
 import time
-import os
-import requests
 import threading
+import requests
 
-DERIV_TOKEN = os.getenv("DERIV_TOKEN")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# === CONFIGURATION ===
+APP_ID = "1089"
+WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+TELEGRAM_TOKEN = "8343666564:AAGrM2fgR9hCREwTccmQovM3roNVCO5xdVA"
+TELEGRAM_CHAT_ID = "6868476259"
 
-markets = ["R_75", "R_100", "frxEURUSD", "frxUSDJPY"]  # No Boom & Crash
+SYMBOLS = ["R_75", "R_100", "frxUSDJPY", "frxEURUSD"]
+SL_PERCENT = 0.30
+TP_PERCENT = 0.40
 
-live_signals = []
-wins = 0
-losses = 0
+win_count = 0
+loss_count = 0
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    requests.post(url, json=payload)
-
-def calculate_win_rate():
-    total = wins + losses
-    if total == 0:
-        return "0%"
-    return f"{(wins / total) * 100:.1f}%"
-
-def handle_signal(market, price):
-    global wins, losses
-    # Fake signal logic for demonstration
-    sl = price - 0.2
-    tp = price + 0.5
-    signal = {"market": market, "price": price, "sl": sl, "tp": tp}
-    live_signals.append(signal)
-
-    msg = (
-        f"📊 Signal on {market}\n"
-        f"Price: {price}\n"
-        f"TP: {tp}\n"
-        f"SL: {sl}\n"
-        f"Win Rate: {calculate_win_rate()}"
-    )
-    send_telegram(msg)
-
-    # Simulate signal outcome
-    time.sleep(3)
-    result = "win" if tp > price else "loss"
-    if result == "win":
-        wins += 1
-    else:
-        losses += 1
-
-def on_message(ws, message):
-    data = json.loads(message)
-
-    if "error" in data:
-        send_telegram(f"❌ {data['error'].get('message', 'Unknown error')}")
-        ws.close()
-        return
-
-    if "tick" in data:
-        symbol = data["tick"]["symbol"]
-        price = data["tick"]["quote"]
-        handle_signal(symbol, price)
-
-def on_open(ws):
-    symbol = ws.market
-    send_telegram(f"✅ D-SmartTrader ({symbol}) is now LIVE!")
-    ws.send(json.dumps({
-        "ticks": symbol,
-        "subscribe": 1,
-        "authorization": DERIV_TOKEN
-    }))
-
-def on_error(ws, error):
-    send_telegram(f"⚠️ WebSocket Error ({ws.market}): {error}")
+def send_telegram(msg):
     try:
-        ws.close()
-    except:
-        pass
-
-def on_close(ws, close_status_code, close_msg):
-    send_telegram(f"🔌 D-SmartTrader ({ws.market}) disconnected.")
-
-def connect_market(market):
-    def run():
-        ws = websocket.WebSocketApp(
-            f"wss://ws.derivws.com/websockets/v3?app_1d={1089}",
-            on_open=lambda ws: on_open(ws),
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
         )
-        ws.market = market
-        ws.run_forever()
-    threading.Thread(target=run).start()
+    except:
+        print("Telegram error")
+
+def connect_and_stream(symbol):
+    ws = websocket.create_connection(WS_URL)
+    send_telegram(f"✅ D-SmartTrader ({symbol}) is now LIVE!")
+
+    def subscribe_ticks():
+        ws.send(json.dumps({
+            "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "count": 20,
+            "end": "latest",
+            "start": 1,
+            "style": "candles",
+            "granularity": 60,
+            "subscribe": 1
+        }))
+
+    subscribe_ticks()
+
+    candles = []
+
+    while True:
+        try:
+            msg = json.loads(ws.recv())
+
+            if "error" in msg:
+                send_telegram(f"❌ {symbol} Error: {msg['error']['message']}")
+                break
+
+            if "candles" in msg:
+                candles = msg["candles"]
+            elif "history" in msg and "candles" in msg["history"]:
+                candles = msg["history"]["candles"]
+            elif "ohlc" in msg:
+                ohlc = msg["ohlc"]
+                candles.append({
+                    "open": float(ohlc["open"]),
+                    "high": float(ohlc["high"]),
+                    "low": float(ohlc["low"]),
+                    "close": float(ohlc["close"]),
+                })
+                if len(candles) > 20:
+                    candles.pop(0)
+
+            if len(candles) >= 14:
+                analyze_signal(symbol, candles)
+        except Exception as e:
+            send_telegram(f"⚠️ WebSocket Error ({symbol}): {e}")
+            break
+
+    ws.close()
+    send_telegram(f"🔌 D-SmartTrader ({symbol}) disconnected.")
+
+def rsi(data, period=14):
+    gains, losses = [], []
+    for i in range(1, period + 1):
+        change = data[i]["close"] - data[i-1]["close"]
+        if change >= 0:
+            gains.append(change)
+        else:
+            losses.append(abs(change))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period if losses else 1
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def sma(data, period=14):
+    return sum(d["close"] for d in data[-period:]) / period
+
+def analyze_signal(symbol, candles):
+    global win_count, loss_count
+
+    last_close = candles[-1]["close"]
+    current_rsi = rsi(candles)
+    current_ma = sma(candles)
+
+    signal = None
+    if current_rsi > 70 and last_close < current_ma:
+        signal = "SELL"
+    elif current_rsi < 30 and last_close > current_ma:
+        signal = "BUY"
+
+    if signal:
+        sl = last_close * (1 - SL_PERCENT if signal == "BUY" else 1 + SL_PERCENT)
+        tp = last_close * (1 + TP_PERCENT if signal == "BUY" else 1 - TP_PERCENT)
+
+        # Dummy trade outcome simulation
+        outcome = "WIN" if current_rsi < 60 else "LOSS"
+        if outcome == "WIN":
+            win_count += 1
+        else:
+            loss_count += 1
+
+        win_rate = (win_count / (win_count + loss_count)) * 100 if (win_count + loss_count) > 0 else 0
+
+        msg = f"""📡 Signal on {symbol}
+🔹 Action: {signal}
+💰 Entry: {round(last_close, 3)}
+📈 TP: {round(tp, 3)}
+📉 SL: {round(sl, 3)}
+📊 RSI: {round(current_rsi, 2)}
+🧠 MA: {round(current_ma, 2)}
+✅ Win rate: {round(win_rate, 1)}% ({win_count}W/{loss_count}L)
+        """
+        send_telegram(msg)
+
+def start_bot():
+    threads = []
+    for symbol in SYMBOLS:
+        t = threading.Thread(target=connect_and_stream, args=(symbol,))
+        t.start()
+        threads.append(t)
+        time.sleep(2)
+
+    for t in threads:
+        t.join()
 
 if __name__ == "__main__":
     send_telegram("🤖 D-SmartTrader bot is starting up...")
-    for market in markets:
-        connect_market(market)
-    while True:
-        time.sleep(5)
+    start_bot()
