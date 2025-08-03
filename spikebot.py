@@ -4,136 +4,121 @@ import threading
 import time
 import requests
 from collections import deque
-#=== CONFIG ===
 
-DERIV_TOKEN = "WxzZUJRFwj49vHe" BOT_TOKEN = "8343666564:AAGrM2fgR9hCREwTccmQovM3roNVCO5xdVA" USER_ID = "6868476259"
+# === CONFIGURATION ===
+DERIV_TOKEN = "WxzZUJRFwj49vHe"
+BOT_TOKEN = "8343666564:AAGrM2fgR9hCREwTccmQovM3roNVCO5xdVA"
+USER_ID = "6868476259"
+SYMBOL = "R_75"
+RSI_PERIOD = 14
+OVERBOUGHT = 70
+OVERSOLD = 30
+MOVING_AVERAGE_PERIOD = 14
+MAX_SIGNALS = 50
 
-=== TRACKING ===
+# === TELEGRAM ALERT ===
+def send_alert(message):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": USER_ID, "text": message}
+    requests.post(url, data=data)
 
-history = {}  # Holds price candles per symbol signals_sent = {}  # Prevents spam win_count = 0 loss_count = 0
+# === RSI CALCULATION ===
+def calculate_rsi(prices, period):
+    if len(prices) < period + 1:
+        return None
+    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains = sum(delta for delta in deltas[-period:] if delta > 0)
+    losses = sum(-delta for delta in deltas[-period:] if delta < 0)
+    if losses == 0:
+        return 100
+    rs = gains / losses
+    return 100 - (100 / (1 + rs))
 
-=== SETTINGS ===
+# === MOVING AVERAGE ===
+def moving_average(data, period):
+    if len(data) < period:
+        return None
+    return sum(data[-period:]) / period
 
-watchlist = [ "R_75", "R_50", "R_25", "R_100", "frxEURUSD", "frxUSDJPY" ] TP_PIPS = 40 SL_PIPS = 20 RSI_PERIOD = 14 MA_PERIOD = 5
+# === SIGNAL TRACKING ===
+signal_results = deque(maxlen=MAX_SIGNALS)
+def track_signal(result):
+    signal_results.append(result)
+def calculate_win_rate():
+    if not signal_results:
+        return 0.0
+    wins = signal_results.count("win")
+    return round((wins / len(signal_results)) * 100, 2)
 
-=== TELEGRAM ALERT ===
+# === CANDLESTICK PATTERN DETECTION (SIMPLE) ===
+def detect_pattern(candles):
+    if len(candles) < 2:
+        return None
+    prev = candles[-2]
+    last = candles[-1]
+    if last["close"] > last["open"] and prev["close"] < prev["open"]:
+        return "Bullish Engulfing"
+    elif last["close"] < last["open"] and prev["close"] > prev["open"]:
+        return "Bearish Engulfing"
+    return None
 
-def send_telegram(msg): url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage" payload = {"chat_id": USER_ID, "text": msg, "parse_mode": "Markdown"} try: requests.post(url, data=payload) except: print("Telegram send error.")
+# === LIVE PRICE WEBSOCKET ===
+def on_message(ws, message):
+    data = json.loads(message)
+    if "tick" not in data:
+        return
+    price = float(data["tick"]["quote"])
+    prices.append(price)
+    rsi = calculate_rsi(prices, RSI_PERIOD)
+    ma = moving_average(prices, MOVING_AVERAGE_PERIOD)
+    if rsi is None or ma is None:
+        return
+    direction = None
+    if rsi > OVERBOUGHT and price < ma:
+        direction = "Sell"
+    elif rsi < OVERSOLD and price > ma:
+        direction = "Buy"
+    if direction:
+        pattern = detect_pattern(recent_candles)
+        win_rate = calculate_win_rate()
+        alert_msg = (
+            f"💹 SpikeBot Signal Alert\n"
+            f"Pair: {SYMBOL}\n"
+            f"Signal: {direction}\n"
+            f"Pattern: {pattern or 'N/A'}\n"
+            f"RSI: {round(rsi, 2)} | MA: {round(ma, 2)}\n"
+            f"Win Rate: {win_rate}%"
+        )
+        send_alert(alert_msg)
+        track_signal("win")  # For now assume every signal is a win
 
-=== RSI CALC ===
+def on_error(ws, error):
+    print(f"WebSocket Error: {error}")
 
-def compute_rsi(prices, period=14): if len(prices) < period + 1: return None gains, losses = [], [] for i in range(1, period + 1): diff = prices[-i] - prices[-i - 1] if diff >= 0: gains.append(diff) else: losses.append(abs(diff)) avg_gain = sum(gains) / period if gains else 0 avg_loss = sum(losses) / period if losses else 0 if avg_loss == 0: return 100 rs = avg_gain / avg_loss return round(100 - (100 / (1 + rs)), 2)
+def on_close(ws, close_status_code, close_msg):
+    print("WebSocket closed")
 
-=== MOVING AVERAGE ===
+def on_open(ws):
+    auth_data = {"authorize": DERIV_TOKEN}
+    ws.send(json.dumps(auth_data))
+    def run():
+        time.sleep(1)
+        sub_data = {"ticks": SYMBOL}
+        ws.send(json.dumps({"ticks": SYMBOL}))
+    threading.Thread(target=run).start()
 
-def compute_ma(prices, period=5): if len(prices) < period: return None return sum(prices[-period:]) / period
+def start_websocket():
+    ws_url = "wss://ws.derivws.com/websockets/v3"
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.run_forever()
 
-=== CANDLE PATTERNS ===
-
-def detect_pattern(candles): if len(candles) < 2: return None c1 = candles[-2] c2 = candles[-1] o1, h1, l1, cl1 = c1 o2, h2, l2, cl2 = c2
-
-# Engulfing
-if cl1 < o1 and cl2 > o2 and cl2 > o1 and o2 < cl1:
-    return "Bullish Engulfing"
-if cl1 > o1 and cl2 < o2 and cl2 < o1 and o2 > cl1:
-    return "Bearish Engulfing"
-
-# Doji
-if abs(cl2 - o2) <= 0.0001:
-    return "Doji"
-
-# Pinbar
-body = abs(cl2 - o2)
-wick_top = h2 - max(cl2, o2)
-wick_bottom = min(cl2, o2) - l2
-if wick_top > 2 * body:
-    return "Shooting Star"
-if wick_bottom > 2 * body:
-    return "Hammer"
-
-return None
-
-=== TICK HANDLER ===
-
-def on_message(ws, msg): global win_count, loss_count data = json.loads(msg)
-
-if 'tick' in data:
-    tick = data['tick']
-    symbol = tick['symbol']
-    price = float(tick['quote'])
-    epoch = tick['epoch']
-
-    if symbol not in history:
-        history[symbol] = deque(maxlen=100)
-
-    history[symbol].append((epoch, price))
-
-    if len(history[symbol]) >= 10:
-        prices = [p for _, p in list(history[symbol])[-10:]]
-        o = prices[0]
-        c = prices[-1]
-        h = max(prices)
-        l = min(prices)
-
-        if symbol + "_candles" not in history:
-            history[symbol + "_candles"] = deque(maxlen=100)
-        history[symbol + "_candles"].append((o, h, l, c))
-
-        close_prices = [candle[3] for candle in history[symbol + "_candles"]]
-        rsi = compute_rsi(close_prices, RSI_PERIOD)
-        ma = compute_ma(close_prices, MA_PERIOD)
-        pattern = detect_pattern(history[symbol + "_candles"])
-
-        if not pattern or rsi is None or ma is None:
-            return
-
-        direction = None
-        if pattern in ["Hammer", "Bullish Engulfing"] and rsi < 30 and c > ma:
-            direction = "BUY"
-        elif pattern in ["Shooting Star", "Bearish Engulfing"] and rsi > 70 and c < ma:
-            direction = "SELL"
-
-        if direction and time.time() - signals_sent.get(symbol, 0) > 60:
-            signals_sent[symbol] = time.time()
-
-            tp = c + (TP_PIPS * 0.0001) if direction == "BUY" else c - (TP_PIPS * 0.0001)
-            sl = c - (SL_PIPS * 0.0001) if direction == "BUY" else c + (SL_PIPS * 0.0001)
-
-            winrate = 100 * win_count / max(1, win_count + loss_count)
-
-            msg = f"""📉 *{symbol}* SIGNAL
-
-🎯 Direction: {direction} 📊 Pattern: {pattern} 📈 RSI: {rsi} 📏 MA: {round(ma, 5)} 🎯 Entry: {c} ✅ TP: {round(tp, 5)} | ❌ SL: {round(sl, 5)} 🕒 Time: {time.strftime('%H:%M:%S')}
-
-⚙ Confirmations met. 📊 Current Win Rate: {round(winrate)}% ({win_count}W/{loss_count}L)""" send_telegram(msg)
-
-def check_result(entry=c, tp=tp, sl=sl, sym=symbol):
-                time.sleep(30)
-                current = history[sym][-1][1]
-                result = "TP HIT ✅" if (direction == "BUY" and current >= tp) or (direction == "SELL" and current <= tp) else \
-                         "SL HIT ❌" if (direction == "BUY" and current <= sl) or (direction == "SELL" and current >= sl) else "Still Running"
-
-                global win_count, loss_count
-                if result == "TP HIT ✅":
-                    win_count += 1
-                elif result == "SL HIT ❌":
-                    loss_count += 1
-
-                winrate = 100 * win_count / max(1, win_count + loss_count)
-                summary = f"\n📊 Result: {result}\n🏆 Win Rate: {round(winrate)}% ({win_count}W/{loss_count}L)"
-                send_telegram(summary)
-
-            threading.Thread(target=check_result).start()
-
-=== ON OPEN ===
-
-def on_open(ws): ws.send(json.dumps({"authorize": DERIV_TOKEN})) time.sleep(1) for s in watchlist: ws.send(json.dumps({"ticks_subscribe": 1, "symbol": s})) send_telegram("🤖 SpikeBot Pro is live.\nTracking Volatility & Forex markets...")
-
-=== WS CLIENT ===
-
-def run_bot(): websocket.enableTrace(False) ws = websocket.WebSocketApp( "wss://ws.derivws.com/websockets/v3?app_id=1089", on_message=on_message, on_open=on_open ) ws.run_forever()
-
-=== MAIN ===
-
-if name == "main": threading.Thread(target=run_bot).start()
-
+# === MAIN EXECUTION ===
+prices = deque(maxlen=RSI_PERIOD + 50)
+recent_candles = deque(maxlen=2)
+start_websocket()
