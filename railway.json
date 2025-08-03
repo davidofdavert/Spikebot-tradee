@@ -1,8 +1,6 @@
 {
   "build": {
-    "env": {
-      "PYTHONUNBUFFERED": "1"
-    }
+    "builder": "NIXPACKS"
   },
-  "start": "python spikebot.py"
+  "start": "python3 spikebot.py"
 }
