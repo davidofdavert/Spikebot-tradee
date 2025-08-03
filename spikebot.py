@@ -73,7 +73,7 @@ Win Rate: {calculate_winrate()}%"""
             track_signal("win")  # Placeholder logic
 
 def start_ws(symbol):
-    ws_url = "wss://ws.derivws.com/websockets/v3"
+    ws_url = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
     ws = None
 
     def on_open(ws):
