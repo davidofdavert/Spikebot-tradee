@@ -86,7 +86,7 @@ def on_close(ws, close_status_code, close_msg):
 def connect_market(market):
     def run():
         ws = websocket.WebSocketApp(
-            f"wss://ws.derivws.com/websockets/v3",
+            f"wss://ws.derivws.com/websockets/v3?app_1d={1089}",
             on_open=lambda ws: on_open(ws),
             on_message=on_message,
             on_error=on_error,
