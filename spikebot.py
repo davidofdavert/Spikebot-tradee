@@ -1,6 +1,10 @@
-import websocket import json import threading import time import requests from collections import deque
-
-=== CONFIG ===
+import websocket
+import json
+import threading
+import time
+import requests
+from collections import deque
+#=== CONFIG ===
 
 DERIV_TOKEN = "WxzZUJRFwj49vHe" BOT_TOKEN = "8343666564:AAGrM2fgR9hCREwTccmQovM3roNVCO5xdVA" USER_ID = "6868476259"
 
