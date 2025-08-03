@@ -4,11 +4,9 @@ import threading
 import time
 import requests
 from collections import deque
-import signal
-import sys
 
 # === CONFIGURATION ===
-DERIV_TOKEN = "SXdVTq3NnN4HaAY"
+DERIV_TOKEN = "SXdVTq3NnN4HaAY"  # Replace with your actual Deriv API token
 BOT_TOKEN = "8343666564:AAGrM2fgR9hCREwTccmQovM3roNVCO5xdVA"
 USER_ID = "6868476259"
 SYMBOL = "R_75"
@@ -22,7 +20,10 @@ MAX_SIGNALS = 50
 def send_alert(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {"chat_id": USER_ID, "text": message}
-    requests.post(url, data=data)
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        print("Telegram error:", e)
 
 # === RSI CALCULATION ===
 def calculate_rsi(prices, period):
@@ -64,51 +65,68 @@ def detect_pattern(candles):
         return "Bearish Engulfing"
     return None
 
-# === PRICE SOCKET ===
+# === LIVE PRICE WEBSOCKET ===
 def on_message(ws, message):
     data = json.loads(message)
+
+    # Handle authorization error
+    if "error" in data:
+        print("Authorization Error:", data["error"])
+        send_alert("❌ D-SmartTrader failed to authorize: " + str(data["error"]))
+        ws.close()
+        return
+
+    # After successful authorization
+    if data.get("msg_type") == "authorize":
+        send_alert("✅ D-SmartTrader is now LIVE!")
+        sub_msg = json.dumps({"ticks": SYMBOL})
+        ws.send(sub_msg)
+        return
+
     if "tick" not in data:
         return
+
     price = float(data["tick"]["quote"])
     prices.append(price)
+
     rsi = calculate_rsi(prices, RSI_PERIOD)
     ma = moving_average(prices, MOVING_AVERAGE_PERIOD)
     if rsi is None or ma is None:
         return
+
     direction = None
     if rsi > OVERBOUGHT and price < ma:
         direction = "Sell"
     elif rsi < OVERSOLD and price > ma:
         direction = "Buy"
+
     if direction:
         pattern = detect_pattern(recent_candles)
         win_rate = calculate_win_rate()
         alert_msg = (
-            f"💹 D-SmartTrader Signal\n"
+            f"💹 D-SmartTrader Signal Alert\n"
             f"Pair: {SYMBOL}\n"
             f"Signal: {direction}\n"
             f"Pattern: {pattern or 'N/A'}\n"
             f"RSI: {round(rsi, 2)} | MA: {round(ma, 2)}\n"
-            f"📈 Win Rate: {win_rate}%"
+            f"📊 Win Rate: {win_rate}%"
         )
         send_alert(alert_msg)
-        track_signal("win")  # For now assume win
+        track_signal("win")  # You can change logic here later
 
 def on_error(ws, error):
     print(f"WebSocket Error: {error}")
+    send_alert("⚠️ D-SmartTrader WebSocket Error occurred!")
 
 def on_close(ws, close_status_code, close_msg):
-    send_alert("⚠️ D-SmartTrader has gone offline!")
+    print("WebSocket closed")
+    send_alert("🔴 D-SmartTrader is now OFFLINE!")
 
 def on_open(ws):
-    ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-    def run():
-        time.sleep(1)
-        ws.send(json.dumps({"ticks": SYMBOL}))
-    threading.Thread(target=run).start()
+    auth_msg = json.dumps({"authorize": DERIV_TOKEN})
+    ws.send(auth_msg)
 
 def start_websocket():
-    send_alert("🤖 D-SmartTrader is now LIVE!")
     ws_url = "wss://ws.derivws.com/websockets/v3"
     ws = websocket.WebSocketApp(
         ws_url,
@@ -117,16 +135,9 @@ def start_websocket():
         on_error=on_error,
         on_close=on_close
     )
-    def graceful_shutdown(signum, frame):
-        send_alert("⚠️ D-SmartTrader has gone offline!")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, graceful_shutdown)
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-
     ws.run_forever()
 
-# === START ===
+# === MAIN EXECUTION ===
 prices = deque(maxlen=RSI_PERIOD + 50)
 recent_candles = deque(maxlen=2)
 start_websocket()
