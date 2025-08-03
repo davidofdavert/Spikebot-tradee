@@ -4,6 +4,8 @@ import threading
 import time
 import requests
 from collections import deque
+import signal
+import sys
 
 # === CONFIGURATION ===
 DERIV_TOKEN = "WxzZUJRFwj49vHe"
@@ -50,7 +52,7 @@ def calculate_win_rate():
     wins = signal_results.count("win")
     return round((wins / len(signal_results)) * 100, 2)
 
-# === CANDLESTICK PATTERN DETECTION (SIMPLE) ===
+# === CANDLESTICK PATTERN DETECTION ===
 def detect_pattern(candles):
     if len(candles) < 2:
         return None
@@ -62,7 +64,7 @@ def detect_pattern(candles):
         return "Bearish Engulfing"
     return None
 
-# === LIVE PRICE WEBSOCKET ===
+# === PRICE SOCKET ===
 def on_message(ws, message):
     data = json.loads(message)
     if "tick" not in data:
@@ -82,32 +84,31 @@ def on_message(ws, message):
         pattern = detect_pattern(recent_candles)
         win_rate = calculate_win_rate()
         alert_msg = (
-            f"💹 SpikeBot Signal Alert\n"
+            f"💹 D-SmartTrader Signal\n"
             f"Pair: {SYMBOL}\n"
             f"Signal: {direction}\n"
             f"Pattern: {pattern or 'N/A'}\n"
             f"RSI: {round(rsi, 2)} | MA: {round(ma, 2)}\n"
-            f"Win Rate: {win_rate}%"
+            f"📈 Win Rate: {win_rate}%"
         )
         send_alert(alert_msg)
-        track_signal("win")  # For now assume every signal is a win
+        track_signal("win")  # For now assume win
 
 def on_error(ws, error):
     print(f"WebSocket Error: {error}")
 
 def on_close(ws, close_status_code, close_msg):
-    print("WebSocket closed")
+    send_alert("⚠️ D-SmartTrader has gone offline!")
 
 def on_open(ws):
-    auth_data = {"authorize": DERIV_TOKEN}
-    ws.send(json.dumps(auth_data))
+    ws.send(json.dumps({"authorize": DERIV_TOKEN}))
     def run():
         time.sleep(1)
-        sub_data = {"ticks": SYMBOL}
         ws.send(json.dumps({"ticks": SYMBOL}))
     threading.Thread(target=run).start()
 
 def start_websocket():
+    send_alert("🤖 D-SmartTrader is now LIVE!")
     ws_url = "wss://ws.derivws.com/websockets/v3"
     ws = websocket.WebSocketApp(
         ws_url,
@@ -116,9 +117,16 @@ def start_websocket():
         on_error=on_error,
         on_close=on_close
     )
+    def graceful_shutdown(signum, frame):
+        send_alert("⚠️ D-SmartTrader has gone offline!")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, graceful_shutdown)
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+
     ws.run_forever()
 
-# === MAIN EXECUTION ===
+# === START ===
 prices = deque(maxlen=RSI_PERIOD + 50)
 recent_candles = deque(maxlen=2)
 start_websocket()
