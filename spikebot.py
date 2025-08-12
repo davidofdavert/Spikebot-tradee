@@ -1,18 +1,16 @@
 import os
 import time
-import talib
 import pandas as pd
-import numpy as np
+import pandas_ta as ta
 import requests
 from datetime import datetime
 from telegram import Bot
 
 # ========== CONFIG ==========
-API_KEY = os.getenv("DERIV_API_KEY")  # your Deriv API key (set in Railway vars)
+API_KEY = os.getenv("DERIV_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-PAIR = "R_75"  # Example: Volatility 75
-TIMEFRAME = "1m"
+PAIR = "R_75"
 BARS = 100
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -22,38 +20,28 @@ def fetch_candles():
     url = f"https://api.deriv.com/api/exchange/v1/history?symbol={PAIR}&granularity=60&count={BARS}"
     resp = requests.get(url)
     data = resp.json()
-    candles = pd.DataFrame(data['candles'])
-    candles['time'] = pd.to_datetime(candles['time'], unit='s')
-    return candles
+    df = pd.DataFrame(data['candles'])
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    return df
 
 # ========== ANALYSIS ==========
 def analyze_signal(df):
-    close = df['close'].values
-    high = df['high'].values
-    low = df['low'].values
-
-    # RSI
-    rsi = talib.RSI(close, timeperiod=14)
-    latest_rsi = rsi[-1]
-
-    # Moving Average (Trend)
-    ma = talib.SMA(close, timeperiod=20)
-    latest_ma = ma[-1]
-
-    # Candlestick pattern
-    engulfing = talib.CDLENGULFING(open=df['open'].values, high=high, low=low, close=close)[-1]
-
-    # Volume strength
+    df['rsi'] = ta.rsi(df['close'], length=14)
+    df['sma'] = ta.sma(df['close'], length=20)
+    df['engulfing'] = ta.cdl_pattern(df, name="engulfing")  # pandas_ta has candlestick patterns
     volume_strength = (df['volume'].iloc[-1] / df['volume'].mean()) * 100
 
-    # Confirmation checks
+    latest_rsi = df['rsi'].iloc[-1]
+    latest_sma = df['sma'].iloc[-1]
+    engulfing = df['engulfing'].iloc[-1]
+
     score = 0
     if latest_rsi < 30:
         score += 25
     elif latest_rsi > 70:
         score += 25
 
-    if close[-1] > latest_ma:
+    if df['close'].iloc[-1] > latest_sma:
         score += 25
     else:
         score += 15
@@ -64,17 +52,15 @@ def analyze_signal(df):
     if volume_strength > 120:
         score += 25
 
-    win_rate_estimate = min(score, 100)  # cap at 100
+    win_rate = min(score, 100)
 
-    # Generate signal
-    if latest_rsi < 30 and close[-1] > latest_ma and engulfing > 0:
-        return "BUY", win_rate_estimate
-    elif latest_rsi > 70 and close[-1] < latest_ma and engulfing < 0:
-        return "SELL", win_rate_estimate
-    else:
-        return None, None
+    if latest_rsi < 30 and df['close'].iloc[-1] > latest_sma and engulfing > 0:
+        return "BUY", win_rate
+    elif latest_rsi > 70 and df['close'].iloc[-1] < latest_sma and engulfing < 0:
+        return "SELL", win_rate
+    return None, None
 
-# ========== SEND ALERT ==========
+# ========== TELEGRAM ==========
 def send_telegram(message):
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
@@ -87,7 +73,7 @@ def main():
 
             if signal:
                 msg = (
-                    f"📊 *D-SmartTrader Signal*\n"
+                    f"📊 D-SmartTrader Signal\n"
                     f"Pair: {PAIR}\n"
                     f"Signal: {signal}\n"
                     f"Estimated Win Rate: {win_rate}%\n"
@@ -96,7 +82,7 @@ def main():
                 send_telegram(msg)
                 print(msg)
 
-            time.sleep(60)  # run every minute
+            time.sleep(60)
         except Exception as e:
             print(f"Error: {e}")
             time.sleep(30)
