@@ -29,7 +29,8 @@ if not DERIV_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # ---------- CONFIG ----------
-SYMBOLS = ["R_75", "R_100", "frxEURUSD", "frxUSDJPY"]  # add/remove as you wish
+SYMBOLS = ["R_75", "R_100", "frxEURUSD", "frxUSDJPY", "frxXAUUSD", "frxAUDUSD","frxGBPUSD", "R_10_1s", "R_25_1s", "R_50_1s", "R_75_1s", "R_100_1s",
+    "RV10", "RV25", "RV50", "RV75", "RV100"]  # add/remove as you wish
 
 RSI_PERIOD = 14
 MA_SHORT_1M = 14
@@ -39,7 +40,7 @@ RSI_OVERBOUGHT = 70
 VOLUME_MULTIPLIER = 1.2
 
 # TP/SL expressed as % of entry (works for both forex & synthetics; tune if you want)
-TP_PCT = 0.0040    # 0.40%
+TP_PCT = 0.0050    # 0.50%
 SL_PCT = 0.0025    # 0.25%
 
 PERSIST_FILE = "d_smarttrader_state.json"
