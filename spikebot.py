@@ -548,7 +548,7 @@ def telegram_poller():
                     if OPEN_TRADES:
                         lines.append("Open trades:")
                         for s, sig in OPEN_TRADES.items():
-                            lines.append(f"{s} {sig['direction']} @ {round(sig['entrRSI_OB = 70
+                            lines.append(f"{s} {sig['direction']} @ {round(sig['entry_price'], 2)} (RSI_OB = 70)")
 VOL_MULT = 1.2
 
 # TP/SL groups -- tune per your instruments
