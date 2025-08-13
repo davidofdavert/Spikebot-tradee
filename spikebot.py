@@ -1,147 +1,34 @@
-import requests
+#!/usr/bin/env python3
+"""
+D-SmartTrader — Clean simplified version
+Features:
+ - Fetches active symbols from Deriv and maps requested symbols
+ - SAFE / STRICT toggle via Telegram: "/strict on" and "/strict off"
+ - Confidence % per signal (RSI + MA trend + candlestick + volume proxy)
+ - Pure Python indicators (no talib), only websocket-client and requests
+ - No TP/SL, no win rate, no trade persistence
+"""
+import os
 import time
-import pandas as pd
-import numpy as np
-from datetime import datetime
+import json
+import threading
+import re
+from collections import deque, defaultdict
 
-# -------------------------------
-# YOUR VARIABLES (already set)
-# -------------------------------
-# DERIV_API_TOKEN
-# TELEGRAM_BOT_TOKEN
-# TELEGRAM_CHAT_ID
+import websocket
+import requests
 
-# -------------------------------
-# DEFAULT SETTINGS
-# -------------------------------
-PAIRS = ["R_50", "R_100", "EURUSD", "GBPUSD"]
-TIMEFRAME = 60  # seconds, 1-minute candles
-SAFE_CONFIDENCE = 85
-STRICT_CONFIDENCE = 95
-MODE = "/safe"  # default mode
+# ---------- CONFIG ----------
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# -------------------------------
-# HELPER FUNCTIONS
-# -------------------------------
+WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
-def fetch_candles(pair, count=50, granularity=60):
-    url = f"https://api.deriv.com/api/v1/candles?symbol={pair}&granularity={granularity}&count={count}"
-    headers = {"Authorization": f"Bearer {DERIV_API_TOKEN}"}
-    response = requests.get(url, headers=headers).json()
-    candles = response.get("candles", [])
-    df = pd.DataFrame(candles)
-    df['time'] = pd.to_datetime(df['epoch'], unit='s')
-    return df
+SYMBOLS_REQUESTED = ["R_50","R_100","EURUSD","GBPUSD"]
 
-def calculate_rsi(df, period=14):
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0)
-    loss = -1*delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def calculate_ma(df, period=20):
-    return df['close'].rolling(period).mean()
-
-def candlestick_signal(df):
-    signals = []
-    for i in range(1, len(df)):
-        prev = df.iloc[i-1]
-        curr = df.iloc[i]
-        if curr['close'] > curr['open'] and prev['close'] < prev['open'] and curr['open'] < prev['close'] and curr['close'] > prev['open']:
-            signals.append("BUY")
-        elif curr['close'] < curr['open'] and prev['close'] > prev['open'] and curr['open'] > prev['close'] and curr['close'] < prev['open']:
-            signals.append("SELL")
-        else:
-            signals.append(None)
-    signals.insert(0, None)
-    return signals
-
-def volume_signal(df):
-    avg_vol = df['volume'].rolling(20).mean()
-    signals = ["HIGH" if v > avg else "LOW" for v, avg in zip(df['volume'], avg_vol)]
-    return signals
-
-def get_confidence(rsi, ma_trend, candle, volume):
-    score = 0
-    if rsi < 30 and candle == "BUY":
-        score += 30
-    if rsi > 70 and candle == "SELL":
-        score += 30
-    if ma_trend == candle:
-        score += 20
-    if volume == "HIGH":
-        score += 20
-    return score
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    requests.post(url, data=data)
-
-def check_telegram_commands():
-    """Check Telegram messages for /safe or /strict commands"""
-    global MODE, CONFIDENCE_THRESHOLD
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    response = requests.get(url).json()
-    for update in response.get("result", []):
-        message = update.get("message", {})
-        chat_id = message.get("chat", {}).get("id")
-        text = message.get("text", "").lower()
-        if chat_id == int(TELEGRAM_CHAT_ID):
-            if text == "/safe":
-                MODE = "/safe"
-                CONFIDENCE_THRESHOLD = SAFE_CONFIDENCE
-                send_telegram("✅ Mode switched to SAFE (85% confidence)")
-            elif text == "/strict":
-                MODE = "/strict"
-                CONFIDENCE_THRESHOLD = STRICT_CONFIDENCE
-                send_telegram("✅ Mode switched to STRICT (95% confidence)")
-
-# -------------------------------
-# MAIN LOOP
-# -------------------------------
-
-CONFIDENCE_THRESHOLD = SAFE_CONFIDENCE if MODE == "/safe" else STRICT_CONFIDENCE
-last_alerts = {pair: None for pair in PAIRS}
-
-while True:
-    # Check Telegram for mode commands
-    check_telegram_commands()
-    
-    for pair in PAIRS:
-        df = fetch_candles(pair, count=50, granularity=TIMEFRAME)
-        df['RSI'] = calculate_rsi(df)
-        df['MA'] = calculate_ma(df)
-        df['Candle'] = candlestick_signal(df)
-        df['Volume'] = volume_signal(df)
-        
-        last = df.iloc[-1]
-        ma_trend = "BUY" if last['close'] > last['MA'] else "SELL"
-        confidence = get_confidence(last['RSI'], ma_trend, last['Candle'], last['Volume'])
-        
-        if confidence >= CONFIDENCE_THRESHOLD and last['Candle'] is not None:
-            if last_alerts[pair] != last['time']:
-                signal = last['Candle']
-                msg = (f"📊 Signal: {signal}\n"
-                       f"Pair: {pair}\n"
-                       f"RSI: {last['RSI']:.2f}\n"
-                       f"MA Trend: {ma_trend}\n"
-                       f"Volume: {last['Volume']}\n"
-                       f"Confidence: {confidence}%\n"
-                       f"Mode: {MODE}\n"
-                       f"Time: {last['time']}")
-                send_telegram(msg)
-                last_alerts[pair] = last['time']
-    
-    time.sleep(TIMEFRAME)    # Forex majors
-    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxAUDUSD", "frxUSDCAD",
-]
-
-# Indicator / signal parameters
+# Indicators / parameters
 RSI_PERIOD = 14
 MA_1M = 14
 MA_5M = 50
@@ -149,46 +36,32 @@ RSI_OB = 70
 RSI_OS = 30
 VOL_MULTIPLIER = 1.2
 
-# TP/SL (percent)
-TP_PCT_BY_GROUP = {"fx": 0.0015, "gold": 0.0020, "vol": 0.0040}
-SL_PCT_BY_GROUP = {"fx": 0.0010, "gold": 0.0012, "vol": 0.0025}
-
-# Confidence thresholds
-SAFE_MIN_CONF = 60.0
-STRICT_MIN_CONF = 85.0
-
-# Persistence
-STATE_FILE = "d_smarttrader_state.json"
+SAFE_MIN_CONF = 85.0
+STRICT_MIN_CONF = 95.0
 
 # ---------- RUNTIME STATE ----------
 MODE = {"mode": "safe"}  # "safe" or "strict"
-SYMBOL_MAP = {}          # requested -> actual (after mapping with active_symbols)
+SYMBOL_MAP = {}          
 AVAILABLE_SYMBOLS = set()
 SUBSCRIBED = set()
-SUBSCRIBE_ATTEMPTS = defaultdict(set)  # actual -> {"candles","ticks","ticks_history"}
+SUBSCRIBE_ATTEMPTS = defaultdict(set)  
 
 # Candle and tick containers
-C1 = defaultdict(lambda: deque(maxlen=400))   # 1m candles per actual symbol
-C5 = defaultdict(lambda: deque(maxlen=400))   # 5m candles
+C1 = defaultdict(lambda: deque(maxlen=400))
+C5 = defaultdict(lambda: deque(maxlen=400))
 TICKS_THIS_MIN = defaultdict(int)
 LAST_MIN_BUCKET = defaultdict(lambda: None)
 LAST_PRICE = {}
 
-# Trade state
-OPEN_TRADES = {}   # actual_symbol -> dict(direction, entry, tp, sl, time, confidence)
-RESULTS = defaultdict(lambda: {"win": 0, "loss": 0})
-LAST_SIGNAL_TS = defaultdict(lambda: 0)
-
-# Misc
 LOCK = threading.Lock()
 WS_OBJ = None
 TG_OFFSET = None
+LAST_SIGNAL_TS = defaultdict(lambda: 0)
 
 # ---------- UTIL FUNCTIONS ----------
 def send_telegram(text: str):
-    """Send message to configured Telegram chat (if configured)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[TG] not configured:", text[:120])
+        print("[TG]", text[:120])
         return
     try:
         requests.post(
@@ -202,44 +75,13 @@ def norm(s: str) -> str:
     return re.sub(r"[^0-9a-z]", "", (s or "").lower())
 
 def best_match(requested: str, available: set) -> str:
-    """Tolerant mapping: preferred exact, fallback to substring match on normalized forms."""
     if requested in available:
         return requested
     rq = norm(requested)
-    if not rq:
-        return None
     for a in available:
         if norm(a) == rq or rq in norm(a) or norm(a) in rq:
             return a
     return None
-
-def load_state():
-    global MODE, SYMBOL_MAP, OPEN_TRADES, RESULTS, LAST_SIGNAL_TS
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                d = json.load(f)
-                MODE["mode"] = d.get("mode", MODE["mode"])
-                SYMBOL_MAP = d.get("symbol_map", SYMBOL_MAP)
-                OPEN_TRADES.update(d.get("open_trades", {}))
-                RESULTS.update(d.get("results", {}))
-                for k,v in d.get("last_signal_ts", {}).items():
-                    LAST_SIGNAL_TS[k] = v
-    except Exception as e:
-        print("load_state error:", e)
-
-def save_state():
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({
-                "mode": MODE["mode"],
-                "symbol_map": SYMBOL_MAP,
-                "open_trades": OPEN_TRADES,
-                "results": RESULTS,
-                "last_signal_ts": dict(LAST_SIGNAL_TS)
-            }, f, indent=2)
-    except Exception as e:
-        print("save_state error:", e)
 
 def group_of_symbol(sym: str) -> str:
     su = sym.upper()
@@ -249,56 +91,120 @@ def group_of_symbol(sym: str) -> str:
         return "fx"
     return "vol"
 
-# ---------- INDICATORS (pure Python) ----------
+# ---------- INDICATORS ----------
 def sma(values, n):
-    if len(values) < n:
-        return None
-    return sum(values[-n:]) / n
+    if len(values) < n: return None
+    return sum(values[-n:])/n
 
 def rsi_calc(values, n=14):
-    if len(values) < n + 1:
-        return None
-    gains = losses = 0.0
-    for i in range(-n, 0):
-        d = values[i] - values[i-1]
-        if d >= 0:
-            gains += d
-        else:
-            losses += -d
-    if losses == 0:
-        return 100.0
-    rs = gains / losses
-    return 100 - (100 / (1 + rs))
+    if len(values)<n+1: return None
+    gains=losses=0.0
+    for i in range(-n,0):
+        d = values[i]-values[i-1]
+        if d>=0: gains+=d
+        else: losses+=-d
+    if losses==0: return 100.0
+    rs=gains/losses
+    return 100-(100/(1+rs))
 
 def detect_engulfing(candles):
-    if len(candles) < 2:
-        return None
-    a, b = candles[-2], candles[-1]
-    # bullish engulfing
-    if a["close"] < a["open"] and b["close"] > b["open"] and b["close"] > a["open"] and b["open"] < a["close"]:
+    if len(candles)<2: return None
+    a,b=candles[-2],candles[-1]
+    if a["close"]<a["open"] and b["close"]>b["open"] and b["close"]>a["open"] and b["open"]<a["close"]:
         return "bullish"
-    # bearish engulfing
-    if a["close"] > a["open"] and b["close"] < b["open"] and b["open"] > a["close"] and b["close"] < a["open"]:
+    if a["close"]>a["open"] and b["close"]<b["open"] and b["open"]>a["close"] and b["close"]<a["open"]:
         return "bearish"
     return None
 
-# ---------- CONFIDENCE & DECISION ----------
+# ---------- CONFIDENCE ----------
 def compute_confidence(actual_sym: str):
-    # needs recent C1 and C5
-    c1 = list(C1[actual_sym])
-    c5 = list(C5[actual_sym])
-    if len(c1) < max(RSI_PERIOD + 1, MA_1M) or len(c5) < MA_5M:
-        return None
-    closes1 = [c["close"] for c in c1]
-    closes5 = [c["close"] for c in c5]
-    r = rsi_calc(closes1, RSI_PERIOD)
-    ma1 = sma(closes1, MA_1M)
-    ma5 = sma(closes5, MA_5M)
-    patt = detect_engulfing(c1[-2:]) if len(c1) >= 2 else None
+    c1=list(C1[actual_sym])
+    c5=list(C5[actual_sym])
+    if len(c1)<max(RSI_PERIOD+1,MA_1M) or len(c5)<MA_5M: return None
+    closes1=[c["close"] for c in c1]
+    closes5=[c["close"] for c in c5]
+    r=rsi_calc(closes1,RSI_PERIOD)
+    ma1=sma(closes1,MA_1M)
+    ma5=sma(closes5,MA_5M)
+    patt=detect_engulfing(c1[-2:]) if len(c1)>=2 else None
+    last_vol=c1[-1].get("volume",0) or TICKS_THIS_MIN.get(actual_sym,0)
+    vols=[c.get("volume",0) for c in c1[-(RSI_PERIOD+5):] if c.get("volume",0)]
+    avg_vol=(sum(vols)/len(vols)) if vols else None
+    vol_ok=(avg_vol is not None and last_vol>avg_vol*VOL_MULTIPLIER)
+    score=0.0
+    dir_hint=None
+    if r<=RSI_OS: score+=30; dir_hint="BUY"
+    elif r>=RSI_OB: score+=30; dir_hint="SELL"
+    trend_ok=(dir_hint=="BUY" and ma1>ma5) or (dir_hint=="SELL" and ma1<ma5)
+    if trend_ok: score+=35
+    if (dir_hint=="BUY" and patt=="bullish") or (dir_hint=="SELL" and patt=="bearish"): score+=20
+    if vol_ok: score+=15
+    score=max(0.0,min(100.0,score))
+    return {"score":round(score,1),"dir":dir_hint,"rsi":round(r,2),"ma1":round(ma1,6),"ma5":round(ma5,6),"pattern":patt or "none","vol_ok":vol_ok,"avg_vol":round(avg_vol,2) if avg_vol else None}
 
-    # volume proxy
-    last_vol = c1[-1].get("volume", 0) or TICKS_THIS_MIN.get(actual_sym, 0)
-    vols = [c.get("volume", 0) for c in c1[-(RSI_PERIOD+5):] if c.get("volume", 0)]
+def should_send_signal(actual_sym: str, now_ts: int):
+    info=compute_confidence(actual_sym)
+    if not info or not info["dir"]: return None
+    min_conf=STRICT_MIN_CONF if MODE["mode"]=="strict" else SAFE_MIN_CONF
+    if info["score"]<min_conf: return None
+    if now_ts-LAST_SIGNAL_TS.get(actual_sym,0)<30: return None
+    LAST_SIGNAL_TS[actual_sym]=now_ts
+    return info
+
+# ---------- DERIV WS ----------
+def try_subscribe(ws, actual):
+    if "candles" not in SUBSCRIBE_ATTEMPTS[actual]:
+        SUBSCRIBE_ATTEMPTS[actual].add("candles")
+        try: ws.send(json.dumps({"candles":actual,"granularity":60,"subscribe":1})); ws.send(json.dumps({"candles":actual,"granularity":300,"subscribe":1}))
+        except: pass
+    if "ticks" not in SUBSCRIBE_ATTEMPTS[actual]:
+        SUBSCRIBE_ATTEMPTS[actual].add("ticks")
+        try: ws.send(json.dumps({"ticks":actual,"subscribe":1}))
+        except: pass
+
+def handle_error_request(ws,msg): pass
+
+def ws_on_open(ws):
+    try: ws.send(json.dumps({"authorize":DERIV_TOKEN}))
+    except: pass
+
+def ws_on_message(ws,raw):
+    global AVAILABLE_SYMBOLS,SYMBOL_MAP,SUBSCRIBED,WS_OBJ
+    WS_OBJ=ws
+    try: msg=json.loads(raw)
+    except: return
+    if "error" in msg: handle_error_request(ws,msg); return
+    mtype=msg.get("msg_type")
+    if mtype=="authorize": ws.send(json.dumps({"active_symbols":"brief","product_type":"basic"})); return
+    if mtype=="active_symbols" and isinstance(msg.get("active_symbols"),list):
+        AVAILABLE_SYMBOLS=set()
+        for it in msg["active_symbols"]:
+            sym=it.get("symbol")
+            if sym: AVAILABLE_SYMBOLS.add(sym)
+        for req in SYMBOLS_REQUESTED:
+            m=best_match(req,AVAILABLE_SYMBOLS)
+            if m: SYMBOL_MAP[req]=m
+        for req,actual in SYMBOL_MAP.items():
+            if actual in SUBSCRIBED: continue
+            try_subscribe(ws,actual)
+            SUBSCRIBED.add(actual)
+        return
+    if mtype=="candles" and isinstance(msg.get("candles"),list):
+        echo=msg.get("echo_req",{}) or {}
+        actual=echo.get("candles") or msg.get("symbol")
+        gran=int(echo.get("granularity",60))
+        container=C1 if gran==60 else C5
+        for c in msg["candles"]:
+            try: candle={"open":float(c["open"]),"high":float(c["high"]),"low":float(c["low"]),"close":float(c["close"]),"volume":float(c.get("volume",0)),"epoch":int(c.get("epoch",time.time()))}
+            except: continue
+            container[actual].append(candle)
+        return
+    if mtype=="ohlc" and "ohlc" in msg:
+        echo=msg.get("echo_req",{}) or {}
+        gran=int(echo.get("granularity",60))
+        actual=echo.get("candles") or msg.get("symbol")
+        o=msg["ohlc"]
+        candle={"open":float(o["r c in c1[-(RSI_PERIOD+5):] if c.get("volume", 0)]
     avg_vol = (sum(vols) / len(vols)) if vols else None
     vol_ok = (avg_vol is not None and last_vol > avg_vol * VOL_MULTIPLIER) or (TICKS_THIS_MIN.get(actual_sym, 0) >= 3)
 
