@@ -551,11 +551,9 @@ def telegram_poller():
                             lines.append(f"{s} {sig['direction']} @ {round(sig['entry_price'], 2)} (RSI_OB = 70)")
 
 # TP/SL groups -- tune per your instruments
-TP_SL = {
-    "fx": {"tp": 0.0015, "sl": 0.0010},
+TP_SL = { "fx": {"tp": 0.0015, "sl": 0.0010},
     "gold": {"tp": 0.0020, "sl": 0.0012},
-    "vol": {"tp": 0.0040, "sl": 0.0025},
-}
+    "vol": {"tp": 0.0040, "sl": 0.0025},}
 
 # Confidence thresholds
 SAFE_MIN_CONF = 60
