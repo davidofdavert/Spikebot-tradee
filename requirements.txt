@@ -1,5 +1,2 @@
-numpy==1.24.4
-pandas==1.5.3
-pandas_ta==0.3.14b0
-requests
-python-telegram-bot==13.15
+websocket-client==1.8.0
+requests==2.32.4
