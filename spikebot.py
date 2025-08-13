@@ -1,40 +1,143 @@
-#!/usr/bin/env python3
-"""
-D-SmartTrader — Clean stable version
-Features:
- - Fetches active symbols from Deriv and maps requested symbols to available ones
- - Subscribes safely (candles + ticks), fallback to ticks_history if needed
- - SAFE / STRICT toggle via Telegram: "/strict on" and "/strict off"
- - Confidence % per signal (RSI + MA trend + candlestick + volume proxy)
- - TP/SL per signal, tracks wins/losses and win rate
- - Pure Python indicators (no talib), only requires websocket-client and requests
- - Persistence to local JSON file (state)
-"""
-import os
-import json
-import time
-import threading
-import re
-from collections import deque, defaultdict
-
-import websocket
 import requests
+import time
+import pandas as pd
+import numpy as np
+from datetime import datetime
 
-# ---------- CONFIG ----------
-DERIV_TOKEN = os.getenv("DERIV_TOKEN")
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# -------------------------------
+# YOUR VARIABLES (already set)
+# -------------------------------
+# DERIV_API_TOKEN
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_CHAT_ID
 
-WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+# -------------------------------
+# DEFAULT SETTINGS
+# -------------------------------
+PAIRS = ["R_50", "R_100", "EURUSD", "GBPUSD"]
+TIMEFRAME = 60  # seconds, 1-minute candles
+SAFE_CONFIDENCE = 85
+STRICT_CONFIDENCE = 95
+MODE = "/safe"  # default mode
 
-# Symbols requested by user (your list)
-SYMBOLS_REQUESTED = [
-    # Volatility
-    "R_10", "R_25", "R_50", "R_75", "R_100",
-    # Gold (will map tolerant -> frxXAUUSD or XAUUSD as available)
-    "XAUUSD",
-    # Forex majors
+# -------------------------------
+# HELPER FUNCTIONS
+# -------------------------------
+
+def fetch_candles(pair, count=50, granularity=60):
+    url = f"https://api.deriv.com/api/v1/candles?symbol={pair}&granularity={granularity}&count={count}"
+    headers = {"Authorization": f"Bearer {DERIV_API_TOKEN}"}
+    response = requests.get(url, headers=headers).json()
+    candles = response.get("candles", [])
+    df = pd.DataFrame(candles)
+    df['time'] = pd.to_datetime(df['epoch'], unit='s')
+    return df
+
+def calculate_rsi(df, period=14):
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -1*delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_ma(df, period=20):
+    return df['close'].rolling(period).mean()
+
+def candlestick_signal(df):
+    signals = []
+    for i in range(1, len(df)):
+        prev = df.iloc[i-1]
+        curr = df.iloc[i]
+        if curr['close'] > curr['open'] and prev['close'] < prev['open'] and curr['open'] < prev['close'] and curr['close'] > prev['open']:
+            signals.append("BUY")
+        elif curr['close'] < curr['open'] and prev['close'] > prev['open'] and curr['open'] > prev['close'] and curr['close'] < prev['open']:
+            signals.append("SELL")
+        else:
+            signals.append(None)
+    signals.insert(0, None)
+    return signals
+
+def volume_signal(df):
+    avg_vol = df['volume'].rolling(20).mean()
+    signals = ["HIGH" if v > avg else "LOW" for v, avg in zip(df['volume'], avg_vol)]
+    return signals
+
+def get_confidence(rsi, ma_trend, candle, volume):
+    score = 0
+    if rsi < 30 and candle == "BUY":
+        score += 30
+    if rsi > 70 and candle == "SELL":
+        score += 30
+    if ma_trend == candle:
+        score += 20
+    if volume == "HIGH":
+        score += 20
+    return score
+
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    requests.post(url, data=data)
+
+def check_telegram_commands():
+    """Check Telegram messages for /safe or /strict commands"""
+    global MODE, CONFIDENCE_THRESHOLD
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    response = requests.get(url).json()
+    for update in response.get("result", []):
+        message = update.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        text = message.get("text", "").lower()
+        if chat_id == int(TELEGRAM_CHAT_ID):
+            if text == "/safe":
+                MODE = "/safe"
+                CONFIDENCE_THRESHOLD = SAFE_CONFIDENCE
+                send_telegram("✅ Mode switched to SAFE (85% confidence)")
+            elif text == "/strict":
+                MODE = "/strict"
+                CONFIDENCE_THRESHOLD = STRICT_CONFIDENCE
+                send_telegram("✅ Mode switched to STRICT (95% confidence)")
+
+# -------------------------------
+# MAIN LOOP
+# -------------------------------
+
+CONFIDENCE_THRESHOLD = SAFE_CONFIDENCE if MODE == "/safe" else STRICT_CONFIDENCE
+last_alerts = {pair: None for pair in PAIRS}
+
+while True:
+    # Check Telegram for mode commands
+    check_telegram_commands()
+    
+    for pair in PAIRS:
+        df = fetch_candles(pair, count=50, granularity=TIMEFRAME)
+        df['RSI'] = calculate_rsi(df)
+        df['MA'] = calculate_ma(df)
+        df['Candle'] = candlestick_signal(df)
+        df['Volume'] = volume_signal(df)
+        
+        last = df.iloc[-1]
+        ma_trend = "BUY" if last['close'] > last['MA'] else "SELL"
+        confidence = get_confidence(last['RSI'], ma_trend, last['Candle'], last['Volume'])
+        
+        if confidence >= CONFIDENCE_THRESHOLD and last['Candle'] is not None:
+            if last_alerts[pair] != last['time']:
+                signal = last['Candle']
+                msg = (f"📊 Signal: {signal}\n"
+                       f"Pair: {pair}\n"
+                       f"RSI: {last['RSI']:.2f}\n"
+                       f"MA Trend: {ma_trend}\n"
+                       f"Volume: {last['Volume']}\n"
+                       f"Confidence: {confidence}%\n"
+                       f"Mode: {MODE}\n"
+                       f"Time: {last['time']}")
+                send_telegram(msg)
+                last_alerts[pair] = last['time']
+    
+    time.sleep(TIMEFRAME)    # Forex majors
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxAUDUSD", "frxUSDCAD",
 ]
 
