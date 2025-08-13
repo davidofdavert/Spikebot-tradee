@@ -24,13 +24,16 @@ SYMBOLS = [
     "R_10", "R_25", "R_50", "R_75", "R_100",
 
     # Gold (Metals)
-    "frxXAUUSD",
+    "XAUUSD",
 
-    # Forex
-    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxAUDUSD", "frxUSDCAD",
-
-    # You can add more synthetic indices here if you need
+    # Forex Pairs
+    "frxEURUSD",
+    "frxUSDJPY",
+    "frxGBPUSD",
+    "frxAUDUSD",
+    "frxUSDCAD",
 ]
+
 
 
 # Indicator settings
