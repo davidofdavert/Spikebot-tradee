@@ -30,21 +30,19 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # ---------- CONFIG ----------
 SYMBOLS = [
-    # Volatility Indices (continuous, no Boom/Crash)
+    # Volatility Indices
     "R_10", "R_25", "R_50", "R_75", "R_100",
+    "R_10S", "R_25S", "R_50S", "R_75S", "R_100S",
 
-    # 1-second tick volatility indices
-    "R_10_1S", "R_25_1S", "R_50_1S", "R_75_1S", "R_100_1S",
+    # Gold (Metals)
+    "frxXAUUSD",
 
-    # Random Volatility Indices
-    "RV_10", "RV_25", "RV_50", "RV_75", "RV_100",
+    # Forex
+    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxAUDUSD", "frxUSDCAD",
 
-    # Forex Majors
-    "frxEURUSD", "frxUSDJPY", "frxGBPUSD",
-
-    # Commodities
-    "frxXAUUSD"
+    # You can add more synthetic indices here if you need
 ]
+
 
 
 
