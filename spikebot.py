@@ -12,6 +12,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PAIR = "R_75"
 BARS = 100
+print("Token:", TELEGRAM_TOKEN)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
