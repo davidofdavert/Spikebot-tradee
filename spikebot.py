@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 # D-SmartTrader — strict confirmation bot for Deriv (forex + volatility, no Boom/Crash)
 # Env vars (Railway → Variables):
@@ -12,18 +11,27 @@
 #   websocket-client==1.8.0
 #   requests==2.32.4
 
-import os, json, time, math, threading
+import os
+import json
+import time
+import math
+import threading
 from collections import deque, defaultdict
 import websocket
 import requests
 import logging
+import stat
 
 # ---------- LOGGING ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("d_smarttrader.log"),
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger("D-SmartTrader")
 
 # ---------- ENV ----------
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
@@ -32,13 +40,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
 
 if not DERIV_TOKEN:
-    logging.error("Missing env variable: DERIV_TOKEN")
+    logger.error("Missing env variable: DERIV_TOKEN")
     raise SystemExit(1)
 if not TELEGRAM_BOT_TOKEN:
-    logging.error("Missing env variable: TELEGRAM_BOT_TOKEN")
+    logger.error("Missing env variable: TELEGRAM_BOT_TOKEN")
     raise SystemExit(1)
 if not TELEGRAM_CHAT_ID:
-    logging.error("Missing env variable: TELEGRAM_CHAT_ID")
+    logger.error("Missing env variable: TELEGRAM_CHAT_ID")
     raise SystemExit(1)
 
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
@@ -46,16 +54,20 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 # ---------- CONFIG ----------
 SYMBOLS = ["R_75", "R_100", "frxEURUSD", "frxUSDJPY"]  # add/remove as you wish
 
+# Symbol-specific TP/SL (multiplier for volatility indices, pips for forex)
+SYMBOL_CONFIG = {
+    "R_75": {"type": "volatility", "multiplier": 0.0040, "sl_multiplier": 0.0025, "precision": 2},
+    "R_100": {"type": "volatility", "multiplier": 0.0040, "sl_multiplier": 0.0025, "precision": 2},
+    "frxEURUSD": {"type": "forex", "pips": 40, "sl_pips": 25, "precision": 5},
+    "frxUSDJPY": {"type": "forex", "pips": 40, "sl_pips": 25, "precision": 3}
+}
+
 RSI_PERIOD = 14
 MA_SHORT_1M = 14
-MA_LONG_5M  = 50
+MA_LONG_5M = 50
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 VOLUME_MULTIPLIER = 1.2
-
-# TP/SL expressed as % of entry (works for both forex & synthetics; tune if you want)
-TP_PCT = 0.0040    # 0.40%
-SL_PCT = 0.0025    # 0.25%
 
 PERSIST_FILE = "d_smarttrader_state.json"
 SIGNAL_COOLDOWN_SEC = 120           # prevent rapid flip-flop per symbol
@@ -68,13 +80,8 @@ open_signals = {}                                        # symbol -> dict
 last_signal_time = defaultdict(lambda: 0)                # cooldown per symbol
 last_error_time = defaultdict(lambda: 0)                 # throttle error spam
 last_candle_epoch = defaultdict(int)                     # for tick count reset
-
-# deques for market data
-candles_1m = {s: deque(maxlen=400) for s in SYMBOLS}   # elements: dict(open,high,low,close,epoch,volume)
-candles_5m = {s: deque(maxlen=400) for s in SYMBOLS}
-tick_counts_1m = defaultdict(int)                      # volume proxy
-
-MODE = "strict"  # global mode: "strict" or "safe"
+mode_lock = threading.Lock()                             # protect MODE
+MODE = "strict"                                          # global mode: "strict" or "safe"
 
 # ---------- UTIL ----------
 def tg_send(text):
@@ -84,31 +91,44 @@ def tg_send(text):
             data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
         )
         if not response.ok:
-            logging.error(f"Telegram send failed: {response.status_code} - {response.text}")
+            logger.error(f"Telegram send failed: {response.status_code} - {response.text}")
     except Exception as e:
-        logging.error(f"Telegram error: {e}")
+        logger.error(f"Telegram error: {e}")
 
 def persist():
     try:
         with state_lock:
-            with open(PERSIST_FILE, "w") as f:
+            with open(PERSIST_FILE, "w", encoding="utf-8") as f:
                 json.dump({"results": dict(results), "open_signals": open_signals}, f)
+                os.chmod(PERSIST_FILE, stat.S_IRUSR | stat.S_IWUSR)
     except Exception as e:
-        logging.error(f"Persist error: {e}")
+        logger.error(f"Persist error: {e}")
 
 def load_persist():
     try:
         if os.path.exists(PERSIST_FILE):
-            with open(PERSIST_FILE, "r") as f:
+            with open(PERSIST_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                results.update(saved.get("results", {}))
+                if not isinstance(saved, dict) or "results" not in saved or "open_signals" not in saved:
+                    logger.error("Invalid persistence file format")
+                    return
+                results_data = saved.get("results", {})
+                if not isinstance(results_data, dict):
+                    logger.error("Invalid results format in persistence file")
+                    return
+                for k, v in results_data.items():
+                    if not isinstance(v, dict) or "win" not in v or "loss" not in v:
+                        logger.error(f"Invalid results data for {k}")
+                        continue
+                    results[k].update(v)
                 open_signals.update(saved.get("open_signals", {}))
     except Exception as e:
-        logging.error(f"Load state error: {e}")
+        logger.error(f"Load state error: {e}")
 
 # ---------- TELEGRAM POLLER ----------
 def telegram_poller():
     offset = 0
+    retry_count = 0
     while True:
         try:
             resp = requests.get(
@@ -116,6 +136,7 @@ def telegram_poller():
                 params={"offset": offset, "timeout": 30}
             )
             if resp.ok:
+                retry_count = 0
                 data = resp.json()
                 if data['ok']:
                     for update in data['result']:
@@ -124,42 +145,52 @@ def telegram_poller():
                             chat_id = str(update['message']['chat']['id'])
                             if chat_id == TELEGRAM_CHAT_ID:
                                 text = update['message']['text'].strip().lower()
-                                global MODE
-                                if text == '/strict':
-                                    MODE = 'strict'
-                                    tg_send("✅ Switched to *STRICT* mode (all 4 confirmations required)")
-                                elif text == '/safe':
-                                    MODE = 'safe'
-                                    tg_send("✅ Switched to *SAFE* mode (at least 3 out of 4 confirmations required)")
+                                with mode_lock:
+                                    global MODE
+                                    if text == '/strict':
+                                        MODE = 'strict'
+                                        tg_send("✅ Switched to *STRICT* mode (all 4 confirmations required)")
+                                    elif text == '/safe':
+                                        MODE = 'safe'
+                                        tg_send("✅ Switched to *SAFE* mode (at least 3 out of 4 confirmations required)")
+            else:
+                logger.error(f"Telegram getUpdates failed: {resp.status_code} - {resp.text}")
+                retry_count += 1
+                time.sleep(min(60, 5 * 2 ** retry_count))
         except Exception as e:
-            logging.error(f"Poller error: {e}")
+            logger.error(f"Poller error: {e}")
+            retry_count += 1
+            time.sleep(min(60, 5 * 2 ** retry_count))
         time.sleep(1)
 
 # ---------- INDICATORS ----------
 def sma(vals, n):
-    if len(vals) < n: return None
+    if len(vals) < n:
+        return None
     return sum(vals[-n:]) / n
 
 def rsi(vals, n=14):
-    if len(vals) < n + 1: return None
+    if len(vals) < n + 1:
+        return None
     gains = 0.0
     losses = 0.0
     for i in range(-n, 0):
         diff = vals[i] - vals[i-1]
-        if diff >= 0: gains += diff
-        else: losses += -diff
-    if losses == 0: return 100.0
+        if diff >= 0:
+            gains += diff
+        else:
+            losses += -diff
+    if losses == 0:
+        return 100.0
     rs = gains / losses
     return 100 - (100 / (1 + rs))
 
 def engulfing(last2):
-    # expects last2 = [prev, last] each dict with open, close
-    if len(last2) < 2: return None
+    if len(last2) < 2:
+        return None
     a, b = last2[-2], last2[-1]
-    # bullish engulfing
     if a["close"] < a["open"] and b["close"] > b["open"] and b["close"] >= a["open"] and b["open"] <= a["close"]:
         return "bullish"
-    # bearish engulfing
     if a["close"] > a["open"] and b["close"] < b["open"] and b["open"] >= a["close"] and b["close"] <= a["open"]:
         return "bearish"
     return None
@@ -167,17 +198,17 @@ def engulfing(last2):
 def build_confidence(direction, rsi_val, trend_ok, pattern, vol_ratio):
     score = 50
     if direction == "BUY" and rsi_val is not None:
-        # deeper oversold => more confidence
         boost = max(0.0, (RSI_OVERSOLD - min(RSI_OVERSOLD, rsi_val)) / max(1, RSI_OVERSOLD)) * 30.0
         score += boost
     if direction == "SELL" and rsi_val is not None:
         boost = max(0.0, (max(RSI_OVERBOUGHT, rsi_val) - RSI_OVERBOUGHT) / max(1, 100 - RSI_OVERBOUGHT)) * 30.0
         score += boost
-    if trend_ok: score += 15
+    if trend_ok:
+        score += 15
     if (direction == "BUY" and pattern == "bullish") or (direction == "SELL" and pattern == "bearish"):
         score += 10
     if vol_ratio is not None:
-        score += min(15.0, max(0.0, (vol_ratio - 1.0) * 10.0))  # mild bump for >1.0x
+        score += min(15.0, max(0.0, (vol_ratio - 1.0) * 10.0))
     return round(max(0, min(100, score)), 1)
 
 def symbol_winrate(sym):
@@ -205,7 +236,6 @@ def maybe_signal(sym):
     trend_sell = ma1 < ma5
     patt = engulfing(c1[-2:])
 
-    # volume (prefer candle volume if present; else tick count)
     last_vol = c1[-1].get("volume") or tick_counts_1m[sym]
     vols = [c.get("volume", 0) for c in c1[-(RSI_PERIOD+5):]]
     nonzero = [v for v in vols if v > 0]
@@ -220,22 +250,23 @@ def maybe_signal(sym):
 
     direction = None
     trend_ok = False
-    if MODE == "strict":
-        if rsi_buy and trend_buy and patt_buy and vol_ok:
-            direction = "BUY"
-            trend_ok = trend_buy
-        elif rsi_sell and trend_sell and patt_sell and vol_ok:
-            direction = "SELL"
-            trend_ok = trend_sell
-    elif MODE == "safe":
-        confirm_buy = sum([rsi_buy, trend_buy, patt_buy, vol_ok])
-        confirm_sell = sum([rsi_sell, trend_sell, patt_sell, vol_ok])
-        if confirm_buy >= 3:
-            direction = "BUY"
-            trend_ok = trend_buy
-        elif confirm_sell >= 3:
-            direction = "SELL"
-            trend_ok = trend_sell
+    with mode_lock:
+        if MODE == "strict":
+            if rsi_buy and trend_buy and patt_buy and vol_ok:
+                direction = "BUY"
+                trend_ok = trend_buy
+            elif rsi_sell and trend_sell and patt_sell and vol_ok:
+                direction = "SELL"
+                trend_ok = trend_sell
+        elif MODE == "safe":
+            confirm_buy = sum([rsi_buy, trend_buy, patt_buy, vol_ok])
+            confirm_sell = sum([rsi_sell, trend_sell, patt_sell, vol_ok])
+            if confirm_buy >= 3:
+                direction = "BUY"
+                trend_ok = trend_buy
+            elif confirm_sell >= 3:
+                direction = "SELL"
+                trend_ok = trend_sell
 
     if not direction:
         return None
@@ -252,20 +283,22 @@ def maybe_signal(sym):
     }
 
 def open_trade(sym, direction, entry, details):
-    if direction == "BUY":
-        tp = entry * (1 + TP_PCT)
-        sl = entry * (1 - SL_PCT)
+    config = SYMBOL_CONFIG.get(sym, {"type": "volatility", "multiplier": 0.0040, "sl_multiplier": 0.0025, "precision": 2})
+    if config["type"] == "forex":
+        pip_value = 0.0001 if config["precision"] == 5 else 0.01
+        tp = entry + config["pips"] * pip_value
+        sl = entry - config["sl_pips"] * pip_value
     else:
-        tp = entry * (1 - TP_PCT)
-        sl = entry * (1 + SL_PCT)
+        tp = entry * (1 + config["multiplier"]) if direction == "BUY" else entry * (1 - config["multiplier"])
+        sl = entry * (1 - config["sl_multiplier"]) if direction == "BUY" else entry * (1 + config["sl_multiplier"])
 
     with state_lock:
         open_signals[sym] = {
             "symbol": sym,
             "direction": direction,
             "entry": entry,
-            "tp": tp,
-            "sl": sl,
+            "tp": round(tp, config["precision"]),
+            "sl": round(sl, config["precision"]),
             "time": int(time.time())
         }
         persist()
@@ -274,9 +307,187 @@ def open_trade(sym, direction, entry, details):
         f"📡 *D-SmartTrader* Signal ({MODE.upper()} mode)\n"
         f"Pair: `{sym}`\n"
         f"Direction: *{direction}*\n"
-        f"Entry: `{entry}`\n"
-        f"TP: `{round(tp,6)}` | SL: `{round(sl,6)}`\n"
+        f"Entry: `{round(entry, config['precision'])}`\n"
+        f"TP: `{round(tp, config['precision'])}` | SL: `{round(sl, config['precision'])}`\n"
         f"RSI: `{details['rsi']}`  MA(1m): `{details['ma1']}`  /  MA(5m): `{details['ma5']}`\n"
+        f"Pattern: `{details['pattern']}`  Volume xAvg: `{details['vol_ratio'] if details['vol_ratio'] else 'n/a'}`\n"
+        f"Confidence: *{details['confidence']}%*  |  Symbol WinRate: *{symbol_winrate(sym)}%*"
+    )
+    tg_send(msg)
+
+def trail_trade_outcomes(sym, price):
+    with state_lock:
+        sig = open_signals.get(sym)
+        if not sig:
+            return
+        config = SYMBOL_CONFIG.get(sym, {"precision": 2})
+        d = sig["direction"]
+        if d == "BUY":
+            if price >= sig["tp"]:
+                results[sym]["win"] += 1
+                del open_signals[sym]
+                persist()
+                tg_send(f"✅ `{sym}` BUY hit TP `{round(price, config['precision'])}` — WinRate now: *{symbol_winrate(sym)}%*")
+            elif price <= sig["sl"]:
+                results[sym]["loss"] += 1
+                del open_signals[sym]
+                persist()
+                tg_send(f"❌ `{sym}` BUY hit SL `{round(price, config['precision'])}` — WinRate now: *{symbol_winrate(sym)}%*")
+        else:
+            if price <= sig["tp"]:
+                results[sym]["win"] += 1
+                del open_signals[sym]
+                persist()
+                tg_send(f"✅ `{sym}` SELL hit TP `{round(price, config['precision'])}` — WinRate now: *{symbol_winrate(sym)}%*")
+            elif price >= sig["sl"]:
+                results[sym]["loss"] += 1
+                del open_signals[sym]
+                persist()
+                tg_send(f"❌ `{sym}` SELL hit SL `{round(price, config['precision'])}` — WinRate now: *{symbol_winrate(sym)}%*")
+
+# ---------- WEBSOCKET ----------
+def on_open(ws):
+    ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+
+def on_message(ws, raw):
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.error("Malformed JSON from WebSocket")
+        return
+
+    if "error" in msg:
+        sym = msg.get("echo_req", {}).get("ticks") or msg.get("echo_req", {}).get("ticks_history") or "GENERAL"
+        now = time.time()
+        if now - last_error_time[sym] > 10:
+            tg_send(f"❌ {sym} Error: {msg['error'].get('message', str(msg['error']))}")
+            last_error_time[sym] = now
+        return
+
+    mtype = msg.get("msg_type")
+
+    if mtype == "authorize":
+        tg_send("✅ *D-SmartTrader* authorized with Deriv. Subscribing feeds…")
+        for sym in SYMBOLS:
+            ws.send(json.dumps({
+                "ticks_history": sym,
+                "style": "candles",
+                "granularity": 60,
+                "count": 300,
+                "end": "latest",
+                "subscribe": 1
+            }))
+            ws.send(json.dumps({
+                "ticks_history": sym,
+                "style": "candles",
+                "granularity": 300,
+                "count": 300,
+                "end": "latest",
+                "subscribe": 1
+            }))
+            ws.send(json.dumps({
+                "ticks": sym,
+                "subscribe": 1
+            }))
+        return
+
+    if mtype == "candles":
+        sym = msg.get("echo_req", {}).get("ticks_history")
+        gran = msg.get("echo_req", {}).get("granularity", 60)
+        if not sym or sym not in SYMBOLS:
+            return
+        arr = msg.get("candles", [])
+        store = candles_5m if gran == 300 else candles_1m
+        for c in arr:
+            if not all(k in c for k in ["open", "high", "low", "close", "epoch"]):
+                logger.warning(f"Malformed candle data for {sym}")
+                continue
+            store[sym].append({
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+                "epoch": int(c["epoch"]),
+                "volume": float(c.get("volume", 0.0))
+            })
+        return
+
+    if mtype == "ohlc":
+        o = msg.get("ohlc", {})
+        sym = o.get("symbol")
+        if not sym or sym not in SYMBOLS:
+            return
+        if not all(k in o for k in ["open", "high", "low", "close", "open_time"]):
+            logger.warning(f"Malformed OHLC data for {sym}")
+            return
+        gran = o.get("granularity", 60)
+        candle = {
+            "open": float(o["open"]),
+            "high": float(o["high"]),
+            "low": float(o["low"]),
+            "close": float(o["close"]),
+            "epoch": int(o["open_time"]),
+            "volume": float(o.get("volume", 0.0))
+        }
+        if gran == 300:
+            candles_5m[sym].append(candle)
+        else:
+            if candle["epoch"] > last_candle_epoch[sym]:
+                tick_counts_1m[sym] = 0
+                last_candle_epoch[sym] = candle["epoch"]
+            candles_1m[sym].append(candle)
+
+        candidate = maybe_signal(sym)
+        if candidate:
+            now = time.time()
+            if sym in open_signals:
+                return
+            if now - last_signal_time[sym] < SIGNAL_COOLDOWN_SEC:
+                return
+            last_signal_time[sym] = now
+            entry = candle["close"]
+            open_trade(sym, candidate["direction"], entry, candidate)
+        return
+
+    if mtype == "tick":
+        t = msg.get("tick", {})
+        sym = t.get("symbol")
+        if not sym or sym not in SYMBOLS:
+            return
+        price = float(t["quote"])
+        tick_counts_1m[sym] += 1
+        trail_trade_outcomes(sym, price)
+        return
+
+def on_error(ws, err):
+    tg_send(f"⚠️ WebSocket Error: {err}")
+
+def on_close(ws, code, reason):
+    tg_send("🔌 D-SmartTrader disconnected. Reconnecting shortly…")
+
+def main():
+    load_persist()
+    tg_send("🚀 D-SmartTrader is starting (strict mode)…")
+    threading.Thread(target=telegram_poller, daemon=True).start()
+    retry_count = 0
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            ws.run_forever()
+            retry_count = 0
+        except Exception as e:
+            tg_send(f"⏳ WS loop error, retrying: {e}")
+            retry_count += 1
+            time.sleep(min(60, 5 * 2 ** retry_count))
+
+if __name__ == "__main__":
+    main()ails['rsi']}`  MA(1m): `{details['ma1']}`  /  MA(5m): `{details['ma5']}`\n"
         f"Pattern: `{details['pattern']}`  Volume xAvg: `{details['vol_ratio'] if details['vol_ratio'] else 'n/a'}`\n"
         f"Confidence: *{details['confidence']}%*  |  Symbol WinRate: *{symbol_winrate(sym)}%*"
     )
