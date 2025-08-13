@@ -20,15 +20,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Your requested symbols
 SYMBOLS = [
-    # Volatility Indices (continuous)
+    # Volatility Indices
     "R_10", "R_25", "R_50", "R_75", "R_100",
 
     # Gold (Metals)
     "frxXAUUSD",
 
-    # Forex majors
+    # Forex
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxAUDUSD", "frxUSDCAD",
+
+    # You can add more synthetic indices here if you need
 ]
+
 
 # Indicator settings
 RSI_PERIOD       = 14
