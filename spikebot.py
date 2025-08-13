@@ -1036,7 +1036,8 @@ def telegram_poller():
                 cid = str(msg.get("chat", {}).get("id", ""))
                 if cid != str(TELEGRAM_CHAT_ID):
                     continue
-                if txt in ("/strict onRSI_OB = 70
+                if txt in ("/strict on", "/strict_off"):
+    RSI_OB = 70
 RSI_OS = 30
 TP_PCT = 0.004
 SL_PCT = 0.0025
