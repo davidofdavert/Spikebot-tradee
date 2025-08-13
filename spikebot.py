@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-# d_smarttrader_fixed.py
-# D-SmartTrader — includes active_symbols validation & tolerant mapping
-# Requirements: websocket-client, requests
-# Set env vars on Railway: DERIV_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-# (Do NOT hardcode tokens in repo.)
-
-import os
-import json
-import time
-import threading
-import re
+"""
+d_smarttrader_fixed.py
+- Fetches active_symbols from Deriv, maps requested symbols to available ones.
+- Subscribes with safe fallbacks (candles -> ticks_history -> ticks).
+- Safe/Strict mode toggle via Telegram: "/strict on", "/strict off".
+- Signals: RSI + MA trend + engulfing + volume proxy -> Confidence %.
+- Per-signal TP/SL, per-symbol Win/Loss and WinRate.
+- No binary packages (no talib). Uses pure python indicators.
+Requires env vars:
+  DERIV_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, (optional) DERIV_APP_ID
+"""
+import os, json, time, threading, re
 from collections import deque, defaultdict
+import websocket, requests
 
-import websocket
-import requests
-
-# ---------- CONFIG ----------
+# ---------------- CONFIG ----------------
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -23,18 +22,507 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
-# user requested symbols (your list)
-REQUESTED_SYMBOLS = [
+# The exact symbols you requested to include
+REQUESTED = [
     "R_10", "R_25", "R_50", "R_75", "R_100",
-    "XAUUSD",   # gold: we'll map tolerant to frxXAUUSD if present
+    "XAUUSD",               # we'll map tolerant -> e.g. frxXAUUSD if available
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxAUDUSD", "frxUSDCAD",
 ]
 
-# minimal trading / signal config (unchanged core logic)
+# Indicator / signal params
 RSI_PERIOD = 14
 MA_FAST_1M = 14
 MA_SLOW_5M = 50
+RSI_OS = 30
 RSI_OB = 70
+VOL_MULT = 1.2
+
+# TP/SL groups -- tune per your instruments
+TP_SL = {
+    "fx": {"tp": 0.0015, "sl": 0.0010},
+    "gold": {"tp": 0.0020, "sl": 0.0012},
+    "vol": {"tp": 0.0040, "sl": 0.0025},
+}
+
+# Confidence thresholds
+SAFE_MIN_CONF = 60
+STRICT_MIN_CONF = 85
+
+STATE_FILE = "d_smarttrader_state.json"
+
+# ---------------- RUNTIME STATE ----------------
+mode_lock = threading.Lock()
+MODE = {"mode": "safe"}   # "safe" or "strict" stored here and persisted
+
+# mapping requested -> actual symbol on Deriv (populated after active_symbols)
+symbol_map = {}           # e.g. "XAUUSD" -> "frxXAUUSD"
+available_symbols = set()
+subscribed = set()
+subscribe_attempts = defaultdict(set)   # symbol -> set of attempted request types: {"candles","ticks_history","ticks"}
+
+# market data
+C1 = defaultdict(lambda: deque(maxlen=400))   # 1m candles per symbol (dicts)
+C5 = defaultdict(lambda: deque(maxlen=400))   # 5m candles per symbol
+TICKS_MIN = defaultdict(int)                  # tick count per current minute for symbol
+LAST_MIN_BUCKET = defaultdict(lambda: None)
+LAST_PRICE = {}
+
+# trade state
+OPEN = {}    # actual_symbol -> {direction, entry, tp, sl, time, confidence}
+RESULTS = defaultdict(lambda: {"win": 0, "loss": 0})
+LAST_SIGNAL_TS = defaultdict(lambda: 0)
+
+# internal helpers
+lock = threading.Lock()
+tg_last_update = 0
+
+# ---------------- UTIL ----------------
+def send_telegram(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TG] disabled (missing env)")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        )
+    except Exception as e:
+        print("[TG] send error:", e)
+
+def norm(s):
+    return re.sub(r'[^0-9a-z]', '', (s or "").lower())
+
+def best_match(req, avail_set):
+    rq = norm(req)
+    if not rq:
+        return None
+    # exact match preferred
+    if req in avail_set:
+        return req
+    for a in avail_set:
+        an = norm(a)
+        if rq == an or rq in an or an in rq:
+            return a
+    return None
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({
+                "mode": MODE["mode"],
+                "symbol_map": symbol_map,
+                "open": OPEN,
+                "results": RESULTS,
+                "last_signal": dict(LAST_SIGNAL_TS)
+            }, f, indent=2)
+    except Exception as e:
+        print("save state err:", e)
+
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                d = json.load(f)
+                MODE["mode"] = d.get("mode", MODE["mode"])
+                for k,v in d.get("open", {}).items():
+                    OPEN[k] = v
+                for k,v in d.get("results", {}).items():
+                    RESULTS[k] = v
+                for k,v in d.get("last_signal", {}).items():
+                    LAST_SIGNAL_TS[k] = v
+    except Exception as e:
+        print("load state err:", e)
+
+def group(sym):
+    # simple grouping for TP/SL percent
+    if sym.upper().startswith("FRXXAU") or sym.upper().endswith("XAUUSD") or "XAU" in sym.upper():
+        return "gold"
+    if sym.upper().startswith("FRX") or sym.lower().startswith("frx"):
+        return "fx"
+    return "vol"
+
+def win_rate(sym):
+    r = RESULTS.get(sym, {"win":0,"loss":0})
+    tot = r["win"] + r["loss"]
+    return 0.0 if tot == 0 else (r["win"] / tot) * 100.0
+
+# ---------------- INDICATORS (pure python) ----------------
+def sma(values, n):
+    if len(values) < n: return None
+    return sum(values[-n:]) / n
+
+def rsi_calc(values, period=14):
+    if len(values) < period + 1: return None
+    gains = losses = 0.0
+    for i in range(-period, 0):
+        diff = values[i] - values[i-1]
+        if diff >= 0: gains += diff
+        else: losses += -diff
+    if losses == 0:
+        return 100.0
+    rs = gains / losses
+    return 100 - (100 / (1 + rs))
+
+def engulfing(candles):
+    if len(candles) < 2: return None
+    a, b = candles[-2], candles[-1]
+    if a["close"] < a["open"] and b["close"] > b["open"] and b["close"] > a["open"] and b["open"] < a["close"]:
+        return "bullish"
+    if a["close"] > a["open"] and b["close"] < b["open"] and b["open"] > a["close"] and b["close"] < a["open"]:
+        return "bearish"
+    return None
+
+# ---------------- CONFIDENCE & DECISION ----------------
+def compute_confidence(sym):
+    c1 = list(C1[sym]); c5 = list(C5[sym])
+    if len(c1) < max(RSI_PERIOD+1, MA_FAST_1M) or len(c5) < MA_SLOW_5M:
+        return None
+    closes1 = [c["close"] for c in c1]
+    closes5 = [c["close"] for c in c5]
+    r = rsi_calc(closes1, RSI_PERIOD)
+    ma1 = sma(closes1, MA_FAST_1M)
+    ma5 = sma(closes5, MA_SLOW_5M)
+    patt = engulfing(c1[-2:]) if len(c1)>=2 else None
+    # volume proxy
+    last_vol = c1[-1].get("volume", 0) or TICKS_MIN.get(sym, 0)
+    vols = [c.get("volume", 0) for c in c1[-(RSI_PERIOD+5):] if c.get("volume", 0)]
+    avg_vol = (sum(vols)/len(vols)) if vols else None
+    vol_ok = (avg_vol and last_vol > avg_vol * VOL_MULT) or (TICKS_MIN.get(sym,0) >= 3)
+
+    score = 0.0
+    dir_hint = None
+    if r is None or ma1 is None or ma5 is None:
+        return None
+    # RSI: up to 30
+    if r <= RSI_OS:
+        score += min(30, (RSI_OS - r) * 1.0); dir_hint = "BUY"
+    elif r >= RSI_OB:
+        score += min(30, (r - RSI_OB) * 1.0); dir_hint = "SELL"
+    # Trend: 35
+    trend_ok = (dir_hint=="BUY" and ma1>ma5) or (dir_hint=="SELL" and ma1<ma5)
+    if trend_ok: score += 35
+    else: score -= 5
+    # Pattern: 20
+    if (dir_hint=="BUY" and patt=="bullish") or (dir_hint=="SELL" and patt=="bearish"):
+        score += 20
+    # Volume: 15
+    if vol_ok: score += 15
+
+    conf = max(0.0, min(100.0, score))
+    return {"r": round(r,2), "ma1": round(ma1,6), "ma5": round(ma5,6), "pattern": patt, "vol_ok": bool(vol_ok), "avg_vol": round(avg_vol,2) if avg_vol else None, "score": round(conf,1), "dir": dir_hint}
+
+def should_open(sym, price, now_ts):
+    info = compute_confidence(sym)
+    if not info or not info["dir"]:
+        return None
+    min_conf = STRICT_MIN_CONF if MODE["mode"] == "strict" else SAFE_MIN_CONF
+    if info["score"] < min_conf:
+        return None
+    # avoid spam / flip within 30s
+    if now_ts - LAST_SIGNAL_TS.get(sym, 0) < 30:
+        return None
+    if sym in OPEN:
+        return None
+    # direction check again
+    d = info["dir"]
+    # compute TP/SL
+    g = group(sym)
+    tp_pct = TP_SL[g]["tp"]; sl_pct = TP_SL[g]["sl"]
+    if d == "BUY":
+        tp = price * (1 + tp_pct); sl = price * (1 - sl_pct)
+    else:
+        tp = price * (1 - tp_pct); sl = price * (1 + sl_pct)
+    return {"direction": d, "tp": tp, "sl": sl, "info": info}
+
+# ---------------- DERIV WS interaction ----------------
+# We'll attempt to subscribe with "candles" + "ticks". If server sends error referencing that request,
+# we'll attempt fallback "ticks_history" subscribe for candles (style:"candles") once.
+
+ws_obj = None
+pending_active_request = False
+
+def try_subscribe(ws, actual_sym):
+    """Try primary subscription (candles streaming + ticks). Don't retry if we've attempted before."""
+    if "candles" not in subscribe_attempts[actual_sym]:
+        subscribe_attempts[actual_sym].add("candles")
+        try:
+            ws.send(json.dumps({"candles": actual_sym, "granularity": 60, "subscribe": 1}))
+            time.sleep(0.05)
+            ws.send(json.dumps({"candles": actual_sym, "granularity": 300, "subscribe": 1}))
+            time.sleep(0.05)
+        except Exception as e:
+            send_telegram(f"Subscribe (candles) send error for {actual_sym}: {e}")
+    if "ticks" not in subscribe_attempts[actual_sym]:
+        subscribe_attempts[actual_sym].add("ticks")
+        try:
+            ws.send(json.dumps({"ticks": actual_sym, "subscribe": 1}))
+        except Exception as e:
+            send_telegram(f"Subscribe (ticks) send error for {actual_sym}: {e}")
+
+def fallback_subscribe_ticks_history(ws, actual_sym):
+    """Fallback: use ticks_history style:'candles' subscribe (if supported)."""
+    if "ticks_history" in subscribe_attempts[actual_sym]:
+        return
+    subscribe_attempts[actual_sym].add("ticks_history")
+    try:
+        ws.send(json.dumps({
+            "ticks_history": actual_sym,
+            "style": "candles",
+            "granularity": 60,
+            "count": 120,
+            "end": "latest",
+            "subscribe": 1
+        }))
+        time.sleep(0.05)
+        ws.send(json.dumps({
+            "ticks_history": actual_sym,
+            "style": "candles",
+            "granularity": 300,
+            "count": 120,
+            "end": "latest",
+            "subscribe": 1
+        }))
+    except Exception as e:
+        send_telegram(f"Fallback subscribe error for {actual_sym}: {e}")
+
+def handle_error_message(ws, msg):
+    # msg includes 'error' and often 'echo_req' that shows what failed
+    echo = msg.get("echo_req", {})
+    # determine symbol attempted
+    sym = echo.get("candles") or echo.get("ticks") or echo.get("ticks_history") or echo.get("active_symbols") or None
+    if not sym:
+        # nothing to fallback
+        return
+    # If candles request failed, try fallback ticks_history once
+    if "candles" in echo and "candles" in subscribe_attempts.get(sym, set()):
+        # already tried candles, fallback
+        if "ticks_history" not in subscribe_attempts[sym]:
+            fallback_subscribe_ticks_history(ws, sym)
+        else:
+            # already tried fallback -> mark as unavailable
+            send_telegram(f"❌ {sym} appears unsupported for candle stream on this account. Skipping.")
+    elif "candles" in echo:
+        # haven't tried candles yet — try subscribe primary
+        try_subscribe(ws, sym)
+    elif "ticks" in echo:
+        # ticks failed — try fallback to ticks_history for candles (but ticks_history may not give live ticks)
+        if "ticks_history" not in subscribe_attempts[sym]:
+            fallback_subscribe_ticks_history(ws, sym)
+        else:
+            send_telegram(f"❌ {sym} ticks subscription unsupported. Skipping ticks for {sym}.")
+    else:
+        # generic error
+        send_telegram(f"❌ Error for {sym}: {msg.get('error')}")
+
+# ---------------- WS callbacks ----------------
+def ws_on_open(ws):
+    try:
+        ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+    except Exception as e:
+        send_telegram(f"Auth send error: {e}")
+
+def ws_on_message(ws, raw):
+    global pending_active_request, available_symbols, symbol_map, subscribed, ws_obj
+    ws_obj = ws
+    try:
+        msg = json.loads(raw)
+    except Exception:
+        return
+
+    # handle error messages first (and attempt fallback)
+    if "error" in msg:
+        # Avoid spamming telegram: print locally too
+        echo = msg.get("echo_req", {})
+        sym = echo.get("candles") or echo.get("ticks") or echo.get("ticks_history") or None
+        em = msg["error"].get("message") if isinstance(msg["error"], dict) else str(msg["error"])
+        print(f"[Deriv error] {sym} -> {em}")
+        handle_error_message(ws, msg)
+        return
+
+    mtype = msg.get("msg_type")
+
+    # authorized -> request active_symbols
+    if mtype == "authorize":
+        send_telegram("✅ D-SmartTrader authorized with Deriv. Requesting active symbols...")
+        try:
+            ws.send(json.dumps({"active_symbols": "brief", "product_type": "basic"}))
+            pending_active_request = True
+        except Exception as e:
+            send_telegram(f"active_symbols request failed: {e}")
+        return
+
+    # active_symbols response
+    if mtype == "active_symbols" and isinstance(msg.get("active_symbols"), list):
+        pending_active_request = False
+        available_symbols = set()
+        for it in msg["active_symbols"]:
+            sym = it.get("symbol")
+            if sym:
+                available_symbols.add(sym)
+        # map requested -> available tolerant
+        found = []; not_found = []
+        for r in REQUESTED:
+            m = best_match(r, available_symbols)
+            if m:
+                symbol_map[r] = m
+                found.append((r,m))
+            else:
+                not_found.append(r)
+        # report mapping
+        lines = ["🔎 Active symbols retrieved."]
+        if found:
+            lines.append("✅ Found / mapped:")
+            for r,m in found: lines.append(f"  • {r} -> {m}")
+        if not_found:
+            lines.append("❌ Not available on this account:")
+            for r in not_found: lines.append(f"  • {r}")
+        send_telegram("\n".join(lines))
+        # subscribe to mapped symbols
+        for r, actual in symbol_map.items():
+            if actual in subscribed: continue
+            try_subscribe(ws, actual)
+            subscribed.add(actual)
+            time.sleep(0.05)
+        return
+
+    # candle history (array)
+    if mtype == "candles" and isinstance(msg.get("candles"), list):
+        # msg.echo_req may include 'candles' key with symbol or 'ticks_history'
+        echo = msg.get("echo_req", {})
+        actual = echo.get("candles") or echo.get("ticks_history") or msg.get("symbol")
+        gran = int(echo.get("granularity", 60))
+        target = C1 if gran == 60 else C5
+        for c in msg["candles"]:
+            candle = {
+                "open": float(c["open"]), "high": float(c["high"]), "low": float(c["low"]),
+                "close": float(c["close"]), "volume": float(c.get("volume", 0)),
+                "epoch": int(c.get("epoch", time.time()))
+            }
+            target[actual].append(candle)
+        return
+
+    # streaming OHLC
+    if mtype == "ohlc" and "ohlc" in msg:
+        echo = msg.get("echo_req", {})
+        gran = int(echo.get("granularity", 60))
+        actual = echo.get("candles") or msg.get("symbol")
+        o = msg["ohlc"]
+        candle = {
+            "open": float(o["open"]), "high": float(o["high"]), "low": float(o["low"]),
+            "close": float(o["close"]), "volume": float(o.get("volume", 0)),
+            "epoch": int(o.get("open_time", time.time()))
+        }
+        if gran == 300:
+            C5[actual].append(candle)
+        else:
+            C1[actual].append(candle)
+            # reset tick proxy on new minute
+            TICKS_MIN[actual] = 0
+        return
+
+    # tick stream
+    if mtype == "tick" and "tick" in msg:
+        t = msg["tick"]
+        actual = t.get("symbol")
+        price = float(t.get("quote"))
+        epoch = int(t.get("epoch", time.time()))
+        LAST_PRICE[actual] = price
+        # minute bucket
+        mb = epoch // 60
+        if LAST_MIN_BUCKET[actual] != mb:
+            TICKS_MIN[actual] = 0
+            LAST_MIN_BUCKET[actual] = mb
+        TICKS_MIN[actual] += 1
+
+        # check open trades for TP/SL
+        if actual in OPEN:
+            s = OPEN[actual]
+            dirn = s["direction"]; tp = s["tp"]; sl = s["sl"]
+            if dirn == "BUY" and price >= tp:
+                RESULTS[actual]["win"] += 1
+                send_telegram(f"✅ `{actual}` BUY TP hit @ `{price}` | WR: {round(win_rate(actual),2)}%")
+                with lock: del OPEN[actual]; save_state_wrapper()
+            elif dirn == "BUY" and price <= sl:
+                RESULTS[actual]["loss"] += 1
+                send_telegram(f"❌ `{actual}` BUY SL hit @ `{price}` | WR: {round(win_rate(actual),2)}%")
+                with lock: del OPEN[actual]; save_state_wrapper()
+            elif dirn == "SELL" and price <= tp:
+                RESULTS[actual]["win"] += 1
+                send_telegram(f"✅ `{actual}` SELL TP hit @ `{price}` | WR: {round(win_rate(actual),2)}%")
+                with lock: del OPEN[actual]; save_state_wrapper()
+            elif dirn == "SELL" and price >= sl:
+                RESULTS[actual]["loss"] += 1
+                send_telegram(f"❌ `{actual}` SELL SL hit @ `{price}` | WR: {round(win_rate(actual),2)}%")
+                with lock: del OPEN[actual]; save_state_wrapper()
+
+        # evaluate potential new signal (only for mapped requested symbols)
+        # ensure actual is in symbol_map.values()
+        if actual not in symbol_map.values():
+            return
+        now_ts = int(time.time())
+        decision = should_open(actual, price, now_ts)
+        if decision:
+            with lock:
+                OPEN[actual] = {
+                    "direction": decision["direction"],
+                    "entry": price,
+                    "tp": decision["tp"],
+                    "sl": decision["sl"],
+                    "time": now_ts,
+                    "confidence": decision["info"]["score"],
+                    "info": decision["info"]
+                }
+                LAST_SIGNAL_TS[actual] = now_ts
+                save_state_wrapper()
+            send_telegram(
+                f"📡 *D-SmartTrader Signal*\n"
+                f"Pair: `{actual}`\n"
+                f"Direction: *{decision['direction']}*\n"
+                f"Entry: `{round(price,6)}`\n"
+                f"TP: `{round(decision['tp'],6)}` | SL: `{round(decision['sl'],6)}`\n"
+                f"RSI: `{decision['info']['r']}` | MA(1m/5m): `{decision['info']['ma1']}` / `{decision['info']['ma5']}`\n"
+                f"Pattern: `{decision['info']['pattern']}` | Vol spike: `{decision['info']['vol_ok']}`\n"
+                f"Confidence: *{decision['info']['score']}%* | Mode: `{MODE['mode'].upper()}`\n"
+                f"WinRate: *{round(win_rate(actual),2)}%*"
+            )
+        return
+
+def ws_on_error(ws, err):
+    print("[WS] error:", err)
+    send_telegram(f"⚠️ WebSocket error: {err}")
+
+def ws_on_close(ws, a=None, b=None):
+    send_telegram("🔌 D-SmartTrader disconnected. Reconnecting...")
+
+# ---------------- Telegram command poller ----------------
+def save_state_wrapper():
+    try:
+        save_state()
+    except Exception:
+        pass
+
+def telegram_poller():
+    global tg_last_update
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TG] missing config; poller disabled")
+        return
+    send_telegram(f"🤖 D-SmartTrader starting ({MODE['mode'].upper()} mode).")
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"timeout": 30, "offset": tg_last_update + 1}
+            ).json()
+            if not resp.get("ok"):
+                time.sleep(2); continue
+            for upd in resp.get("result", []):
+                tg_last_update = upd["update_id"]
+                msg = upd.get("message", {})
+                txt = (msg.get("text") or "").strip().lower()
+                cid = str(msg.get("chat", {}).get("id", ""))
+                if cid != str(TELEGRAM_CHAT_ID):
+                    continue
+                if txt in ("/strict onRSI_OB = 70
 RSI_OS = 30
 TP_PCT = 0.004
 SL_PCT = 0.0025
