@@ -32,7 +32,6 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 SYMBOLS = [
     # Volatility Indices
     "R_10", "R_25", "R_50", "R_75", "R_100",
-    "R_10S", "R_25S", "R_50S", "R_75S", "R_100S",
 
     # Gold (Metals)
     "frxXAUUSD",
