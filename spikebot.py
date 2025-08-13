@@ -29,8 +29,23 @@ if not DERIV_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # ---------- CONFIG ----------
-SYMBOLS = ["R_75", "R_100", "frxEURUSD", "frxUSDJPY", "frxXAUUSD", "frxAUDUSD","frxGBPUSD", "R_10_1s", "R_25_1s", "R_50_1s", "R_75_1s", "R_100_1s",
-    "RV10", "RV25", "RV50", "RV75", "RV100"]  # add/remove as you wish
+SYMBOLS = [
+    # Synthetic Indices (continuous)
+    "R_10", "R_25", "R_50", "R_75", "R_100",
+
+    # 1-second tick indices
+    "R_10_1S", "R_25_1S", "R_50_1S", "R_75_1S", "R_100_1S",
+
+    # Random Volatility Indices
+    "RV_10", "RV_25", "RV_50", "RV_75", "RV_100",
+
+    # Forex
+    "frxEURUSD", "frxUSDJPY", "frxGBPUSD",
+
+    # Commodities
+    "frxXAUUSD"  # Gold vs USD
+]
+
 
 RSI_PERIOD = 14
 MA_SHORT_1M = 14
