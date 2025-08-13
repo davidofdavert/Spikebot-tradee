@@ -1,1 +1,1 @@
-worker: python3 spikebot.py
+worker: python spikebot.py
