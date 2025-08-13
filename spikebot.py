@@ -31,13 +31,13 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 # ---------- CONFIG ----------
 SYMBOLS = [
     # Synthetic Indices (continuous)
-    "R_10", "R_25", "R_50", "R_75", "R_100",
+    "R10", "R25", "R50", "R75", "R100",
 
     # 1-second tick indices
-    "R_10_1S", "R_25_1S", "R_50_1S", "R_75_1S", "R_100_1S",
+    "R10_1S", "R25_1S", "R50_1S", "R75_1S", "R100_1S",
 
     # Random Volatility Indices
-    "RV_10", "RV_25", "RV_50", "RV_75", "RV_100",
+    "RV10", "RV25", "RV50", "RV75", "RV100",
 
     # Forex
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD",
@@ -45,6 +45,7 @@ SYMBOLS = [
     # Commodities
     "frxXAUUSD"  # Gold vs USD
 ]
+
 
 
 RSI_PERIOD = 14
